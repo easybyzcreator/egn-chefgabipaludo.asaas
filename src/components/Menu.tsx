@@ -438,6 +438,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     }
   }, [isCustomModalOpen, selectedProductForDetails]);
 
+  useEffect(() => {
+    if (isModalOpen) {
+      fetch('/api/asaas/config', { credentials: 'same-origin' }).catch(() => {});
+    }
+  }, [isModalOpen]);
+
   const [formData, setFormData] = useState({
     nome: '',
     cpf: '',
@@ -1408,38 +1414,28 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       const orderRef = await addDoc(collection(db, 'pedidos'), orderData);
       setLastCreatedOrderId(orderRef.id);
 
-      // Gerar cobrança de 50% de sinal no Asaas via servidor
+      // Gerar cobrança de 50% de sinal no Asaas via servidor (com retry automático em caso de despertar do servidor)
       let createdAsaasPayment: AsaasPaymentResult | null = null;
       setAsaasPayment(null);
       setAsaasError(null);
-      try {
-        const payRes = await fetch('/api/asaas/create-payment', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            orderId: orderRef.id,
-            customerName: formData.nome,
-            cpfCnpj: formData.cpf,
-            email: formData.email,
-            phone: formData.telefone,
-            street: formData.street,
-            number: formData.number,
-            neighborhood: neighborhoodName,
-            billingType: formData.paymentMethod,
-            installmentCount: selectedInstallments,
-            brandName: settings.brandName || settings.slug,
-          }),
-        });
-        const payJson = await payRes.json();
-        if (!payRes.ok) {
-          setAsaasError(payJson?.error || 'Não foi possível gerar a cobrança no Asaas.');
-        } else {
-          createdAsaasPayment = payJson as AsaasPaymentResult;
-          setAsaasPayment(createdAsaasPayment);
-        }
-      } catch (payErr) {
-        console.error('Erro ao chamar API Asaas:', payErr);
-        setAsaasError('Erro de conexão ao gerar cobrança no Asaas. Tente novamente abaixo.');
+      const asaasResult = await requestAsaasPayment({
+        orderId: orderRef.id,
+        customerName: formData.nome,
+        cpfCnpj: formData.cpf,
+        email: formData.email,
+        phone: formData.telefone,
+        street: formData.street,
+        number: formData.number,
+        neighborhood: neighborhoodName,
+        billingType: formData.paymentMethod,
+        installmentCount: selectedInstallments,
+        brandName: settings.brandName || settings.slug,
+      });
+      if (asaasResult.payment) {
+        createdAsaasPayment = asaasResult.payment;
+        setAsaasPayment(createdAsaasPayment);
+      } else {
+        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança no Asaas.');
       }
 
       // Decrementar estoque de produtos que possuem controle de quantidade
@@ -1607,6 +1603,56 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     }
   };
 
+  const requestAsaasPayment = async (
+    payload: Record<string, unknown>
+  ): Promise<{ payment: AsaasPaymentResult | null; error: string | null }> => {
+    const maxAttempts = 3;
+    let lastError = 'Erro de conexão ao gerar cobrança no Asaas. Tente novamente abaixo.';
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const payRes = await fetch('/api/asaas/create-payment', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const rawText = await payRes.text();
+        let payJson: any = null;
+        try {
+          payJson = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          payJson = null;
+        }
+
+        if (payRes.ok && payJson?.paymentId) {
+          return { payment: payJson as AsaasPaymentResult, error: null };
+        }
+
+        // Transient proxy/wake-up error -> retry automatically
+        const isTransient = payRes.status === 502 || payRes.status === 503 || payRes.status === 504 || !payJson;
+        if (isTransient && attempt < maxAttempts) {
+          await new Promise(resolve => window.setTimeout(resolve, 1500 * attempt));
+          continue;
+        }
+
+        lastError =
+          payJson?.error ||
+          `Não foi possível gerar a cobrança no Asaas (HTTP ${payRes.status}). Tente novamente abaixo.`;
+        return { payment: null, error: lastError };
+      } catch (err) {
+        console.error(`Erro ao chamar API Asaas (tentativa ${attempt}):`, err);
+        if (attempt < maxAttempts) {
+          await new Promise(resolve => window.setTimeout(resolve, 1500 * attempt));
+          continue;
+        }
+      }
+    }
+
+    return { payment: null, error: lastError };
+  };
+
   const handleRetryAsaasPayment = async () => {
     if (!lastCreatedOrderId) return;
     setIsRetryingAsaas(true);
@@ -1619,32 +1665,26 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         ? (formData.neighborhood === 'Outro' ? `Outro (${formData.customNeighborhood.trim()})` : formData.neighborhood)
         : 'Retirada no Local';
 
-      const payRes = await fetch('/api/asaas/create-payment', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId: lastCreatedOrderId,
-          customerName: formData.nome,
-          cpfCnpj: formData.cpf,
-          email: formData.email,
-          phone: formData.telefone,
-          street: formData.street,
-          number: formData.number,
-          neighborhood: neighborhoodName,
-          billingType: formData.paymentMethod,
-          installmentCount: selectedInstallments,
-          brandName: settings.brandName || settings.slug,
-        }),
+      const asaasResult = await requestAsaasPayment({
+        orderId: lastCreatedOrderId,
+        customerName: formData.nome,
+        cpfCnpj: formData.cpf,
+        email: formData.email,
+        phone: formData.telefone,
+        street: formData.street,
+        number: formData.number,
+        neighborhood: neighborhoodName,
+        billingType: formData.paymentMethod,
+        installmentCount: selectedInstallments,
+        brandName: settings.brandName || settings.slug,
       });
-      const payJson = await payRes.json();
-      if (!payRes.ok) {
-        setAsaasError(payJson?.error || 'Não foi possível gerar a cobrança no Asaas.');
-      } else {
-        setAsaasPayment(payJson as AsaasPaymentResult);
+
+      if (asaasResult.payment) {
+        setAsaasPayment(asaasResult.payment);
         toast.success('Cobrança de 50% gerada com sucesso!');
+      } else {
+        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança no Asaas.');
       }
-    } catch {
-      setAsaasError('Erro de conexão ao gerar cobrança no Asaas.');
     } finally {
       setIsRetryingAsaas(false);
     }
@@ -3564,9 +3604,6 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                                 <label className="text-xs font-bold uppercase text-black">
                                   Forma de Pagamento (Sinal 50%) *
                                 </label>
-                                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
-                                  Asaas Seguro
-                                </span>
                               </div>
 
                               <div className="grid grid-cols-2 gap-2">

@@ -110,9 +110,17 @@ export default function AsaasPaymentCard({
       if (!payment?.paymentId || isPaid) return;
       if (manual) setIsChecking(true);
       try {
-        const res = await fetch(`/api/asaas/payment-status/${encodeURIComponent(payment.paymentId)}`);
+        const res = await fetch(`/api/asaas/payment-status/${encodeURIComponent(payment.paymentId)}`, {
+          credentials: 'same-origin',
+        });
+        const rawText = await res.text();
         if (!res.ok) return;
-        const data = await res.json();
+        let data: any = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          return;
+        }
         if (data?.status) {
           setCurrentStatus(data.status);
         }
