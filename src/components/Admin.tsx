@@ -6,7 +6,7 @@ import {
   query, orderBy, serverTimestamp 
 } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
-import { Product, ProductSize, Order, Settings, Category, Side, ImageGallery, VariableCost, DeliveryNeighborhood } from '../types';
+import { Product, ProductSize, Order, OrderInstallmentSummary, Settings, Category, Side, ImageGallery, VariableCost, DeliveryNeighborhood } from '../types';
 import { 
   Settings as SettingsIcon, Package, History, LogOut, Plus, Trash2, Edit2, 
   Save, X, Copy, CheckCircle2, Loader2, Layers, Image as ImageIcon,
@@ -539,6 +539,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   const [orderViewMode, setOrderViewMode] = useState<'week' | 'list' | 'month'>('week');
   const [calendarDate, setCalendarDate] = useState<Date>(new Date());
   const [selectedOrderModal, setSelectedOrderModal] = useState<Order | null>(null);
+  const [isSyncingOrderPayment, setIsSyncingOrderPayment] = useState(false);
   const [isEditingOrderDateInModal, setIsEditingOrderDateInModal] = useState(false);
   const [quickDateValue, setQuickDateValue] = useState('');
   const [quickDatePickerMonth, setQuickDatePickerMonth] = useState<Date>(new Date());
@@ -2263,6 +2264,99 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     });
   };
 
+  const parseOrderInstallments = (order: Order): OrderInstallmentSummary[] => {
+    if (!order.asaasInstallmentsJson) return [];
+    try {
+      const parsed = JSON.parse(order.asaasInstallmentsJson);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const formatIsoDateBR = (iso?: string): string => {
+    if (!iso) return '';
+    const clean = iso.slice(0, 10);
+    const parts = clean.split('-');
+    if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+    return iso;
+  };
+
+  const formatOnlineStatusPt = (status?: string): string => {
+    switch (String(status || '').toUpperCase()) {
+      case 'PENDING':
+        return 'Aguardando Pagamento';
+      case 'PARTIALLY_PAID':
+        return 'Pagamento Parcial';
+      case 'CONFIRMED':
+        return 'Confirmado';
+      case 'RECEIVED':
+      case 'RECEIVED_IN_CASH':
+        return 'Recebido';
+      case 'OVERDUE':
+        return 'Vencido';
+      case 'REFUNDED':
+        return 'Estornado';
+      default:
+        return status || 'Pendente';
+    }
+  };
+
+  const formatPercentLabel = (pct?: number): string => {
+    const val = Number(pct || 0);
+    return `${val.toFixed(1).replace('.0', '').replace('.', ',')}%`;
+  };
+
+  const syncOrderOnlinePayment = async (order: Order) => {
+    if (!order.asaasPaymentId) return;
+    setIsSyncingOrderPayment(true);
+    try {
+      const res = await fetch(`/api/asaas/payment-status/${encodeURIComponent(order.asaasPaymentId)}`, {
+        credentials: 'same-origin',
+      });
+      const raw = await res.text();
+      let data: any = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = null;
+      }
+      if (!res.ok || !data) {
+        toast.error(data?.error || 'Não foi possível consultar o status do pagamento agora.');
+        return;
+      }
+      const nextStatus: 'pending' | 'half' | 'full' =
+        data.orderPaymentStatus === 'full'
+          ? 'full'
+          : data.orderPaymentStatus === 'half'
+            ? 'half'
+            : 'pending';
+      const updatedFields: Partial<Order> = {
+        paymentStatus: nextStatus,
+        asaasStatus: data.status || order.asaasStatus,
+        asaasPaidAmount: typeof data.paidAmount === 'number' ? data.paidAmount : order.asaasPaidAmount,
+        asaasPaidPercent: typeof data.paidPercent === 'number' ? data.paidPercent : order.asaasPaidPercent,
+        asaasPaidInstallmentsCount:
+          typeof data.paidInstallmentsCount === 'number'
+            ? data.paidInstallmentsCount
+            : order.asaasPaidInstallmentsCount,
+        asaasTotalInstallments:
+          typeof data.totalInstallments === 'number'
+            ? data.totalInstallments
+            : order.asaasTotalInstallments,
+        asaasInstallmentsJson: Array.isArray(data.installments)
+          ? JSON.stringify(data.installments)
+          : order.asaasInstallmentsJson,
+      };
+      setSelectedOrderModal(prev => (prev && prev.id === order.id ? { ...prev, ...updatedFields } : prev));
+      toast.success('Status e parcelas sincronizados com sucesso!');
+    } catch {
+      toast.error('Erro de conexão ao sincronizar pagamento.');
+    } finally {
+      setIsSyncingOrderPayment(false);
+    }
+  };
+
   const updateOrderPaymentStatus = async (orderId: string, status: 'pending' | 'half' | 'full') => {
     try {
       await updateDoc(doc(db, 'pedidos', orderId), {
@@ -2713,7 +2807,10 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         const deliveryDate = scheduled.dateDisplay || order.pickupDate || 'N/A';
         const modalityStr = scheduled.isDelivery ? 'Delivery' : 'Retirada';
         
-        textVersion += `#${index + 1} - ${name.toUpperCase()}\nTEL: ${order.phone ? formatBRPhone(order.phone) : 'N/A'}\nAGENDAMENTO: ${deliveryDate} (${modalityStr} - ${scheduled.timeStr || '18:00'})\nSTATUS: ${order.paymentStatus === 'full' ? 'PAGO INTEGRAL' : order.paymentStatus === 'half' ? '50% PAGO' : 'PAGAMENTO PENDENTE'}\nITENS:\n${itemsText || '  Nenhum item'}\nTOTAL: ${currencySymbol} ${Number(order.total || 0).toFixed(2).replace('.', ',')}\n----------------------------------------\n`;
+        const partialPaidStr = Number(order.asaasPaidAmount || 0) > 0
+          ? `PARCIAL (${formatPercentLabel(order.asaasPaidPercent)} - ${currencySymbol} ${Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')})`
+          : 'PAGAMENTO PENDENTE';
+        textVersion += `#${index + 1} - ${name.toUpperCase()}\nTEL: ${order.phone ? formatBRPhone(order.phone) : 'N/A'}\nAGENDAMENTO: ${deliveryDate} (${modalityStr} - ${scheduled.timeStr || '18:00'})\nSTATUS: ${order.paymentStatus === 'full' ? 'PAGO INTEGRAL' : order.paymentStatus === 'half' ? '50% PAGO' : partialPaidStr}\nITENS:\n${itemsText || '  Nenhum item'}\nTOTAL: ${currencySymbol} ${Number(order.total || 0).toFixed(2).replace('.', ',')}\n----------------------------------------\n`;
 
         return `
           <div style="border-bottom: 1px dashed #777; padding: 6px 0; margin-bottom: 6px;">
@@ -2721,7 +2818,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
             <div style="font-size: 10px; color: #333; margin-top: 2px;">
               TEL: ${order.phone ? formatBRPhone(order.phone) : 'N/A'}<br/>
               AGENDAMENTO: ${deliveryDate} (${modalityStr} - ${scheduled.timeStr || '18:00'})<br/>
-              STATUS: ${order.paymentStatus === 'full' ? '✅ PAGO INTEGRAL' : order.paymentStatus === 'half' ? '⏳ 50% PAGO' : '❌ PENDENTE'}
+              STATUS: ${order.paymentStatus === 'full' ? '✅ PAGO INTEGRAL' : order.paymentStatus === 'half' ? '⏳ 50% PAGO' : Number(order.asaasPaidAmount || 0) > 0 ? `🟠 ${partialPaidStr}` : '❌ PENDENTE'}
             </div>
             <div style="font-size: 11px; margin-top: 4px; white-space: pre-wrap;">${itemsText || '  Nenhum item'}</div>
             <div style="font-weight: 900; font-size: 11px; text-align: right; margin-top: 3px;">TOTAL: ${currencySymbol} ${Number(order.total || 0).toFixed(2).replace('.', ',')}</div>
@@ -3098,7 +3195,9 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       const paymentStatusLabel = 
         order.paymentStatus === 'full' ? '✅ 100% PAGO (INTEGRAL)' :
         order.paymentStatus === 'half' ? '⏳ 50% SINAL PAGO' :
-        '❌ PAGAMENTO PENDENTE';
+        Number(order.asaasPaidAmount || 0) > 0
+          ? `🟠 PARCIAL: ${currencySymbol} ${Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')} (${formatPercentLabel(order.asaasPaidPercent)})`
+          : '❌ PAGAMENTO PENDENTE';
 
       const deliveryStatusLabel = 
         order.deliveryStatus === 'delivered' ? '✓ ENTREGUE' : '⏳ A ENTREGAR';
@@ -9379,7 +9478,14 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                                       </span>
                                     ) : order.paymentStatus === 'half' ? (
                                       <span className="font-bold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-md flex items-center gap-1">
-                                        🟡 50%
+                                        🟡 {typeof order.asaasPaidPercent === 'number' && order.asaasPaidPercent > 0 ? formatPercentLabel(order.asaasPaidPercent) : '50%'}
+                                      </span>
+                                    ) : Number(order.asaasPaidAmount || 0) > 0 ? (
+                                      <span
+                                        className="font-bold text-orange-800 bg-orange-50 border border-orange-300 px-1.5 py-0.5 rounded-md inline-flex items-center gap-1"
+                                        title={`Pago ${currencySymbol} ${Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')} (${formatPercentLabel(order.asaasPaidPercent)})`}
+                                      >
+                                        🟠 {formatPercentLabel(order.asaasPaidPercent)} ({currencySymbol} {Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')})
                                       </span>
                                     ) : (
                                       <span className="font-bold text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded-md">
@@ -9762,6 +9868,14 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                         >
                           ✅ Valor Integral
                         </button>
+                        {Number(order.asaasPaidAmount || 0) > 0 && (!order.paymentStatus || order.paymentStatus === 'pending') && (
+                          <span className="ml-1 px-2.5 py-1 text-xs font-extrabold bg-orange-100 text-orange-900 border border-orange-300 rounded-lg">
+                            🟠 Pago Parcial: {currencySymbol} {Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')} ({formatPercentLabel(order.asaasPaidPercent)}
+                            {order.asaasTotalInstallments && order.asaasTotalInstallments > 1
+                              ? ` • ${order.asaasPaidInstallmentsCount || 0}/${order.asaasTotalInstallments} parc.`
+                              : ''})
+                          </span>
+                        )}
                         {(order.paymentStatus === 'half' || order.paymentStatus === 'full') && (
                           <span className="ml-1 px-2.5 py-1 text-xs font-black bg-blue-600 text-white rounded-lg uppercase tracking-wider animate-pulse shadow-md">
                             🚀 Validado para Produção
@@ -10390,6 +10504,22 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                       </button>
                     </div>
 
+                    {/* Pagamento Parcial (ainda não atingiu 50%) */}
+                    {Number(selectedOrderModal.asaasPaidAmount || 0) > 0 && (!selectedOrderModal.paymentStatus || selectedOrderModal.paymentStatus === 'pending') && (
+                      <div className="p-2.5 rounded-xl bg-orange-50 border border-orange-300 text-orange-950 text-[11px] space-y-0.5">
+                        <div className="font-extrabold flex items-center justify-between gap-2">
+                          <span>🟠 Pagamento Parcial Recebido</span>
+                          <span className="font-black">{formatPercentLabel(selectedOrderModal.asaasPaidPercent)}</span>
+                        </div>
+                        <p className="text-[10px] text-orange-900 leading-snug">
+                          Pago até agora: <strong>{currencySymbol} {Number(selectedOrderModal.asaasPaidAmount).toFixed(2).replace('.', ',')}</strong>
+                          {typeof selectedOrderModal.depositAmount === 'number' && selectedOrderModal.depositAmount > Number(selectedOrderModal.asaasPaidAmount) && (
+                            <> • Falta <strong>{currencySymbol} {(selectedOrderModal.depositAmount - Number(selectedOrderModal.asaasPaidAmount)).toFixed(2).replace('.', ',')}</strong> para completar o sinal de 50%.</>
+                          )}
+                        </p>
+                      </div>
+                    )}
+
                     {/* Validado para produção indicator */}
                     {(selectedOrderModal.paymentStatus === 'half' || selectedOrderModal.paymentStatus === 'full') && (
                       <div className="pt-1.5 flex items-center justify-center">
@@ -10399,67 +10529,145 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                       </div>
                     )}
 
-                    {/* Detalhes Asaas / CPF quando presentes */}
-                    {(selectedOrderModal.asaasPaymentId || selectedOrderModal.customerCpf) && (
-                      <div className="pt-2 mt-2 border-t border-gray-200 space-y-1 text-[11px] text-gray-700">
-                        {selectedOrderModal.customerCpf && (
+                    {/* Detalhes de Pagamento Online / CPF / Parcelas */}
+                    {(selectedOrderModal.asaasPaymentId || selectedOrderModal.customerCpf) && (() => {
+                      const installmentsList = parseOrderInstallments(selectedOrderModal);
+                      const paidAmt = Number(selectedOrderModal.asaasPaidAmount || 0);
+                      const paidPct = Number(selectedOrderModal.asaasPaidPercent || 0);
+                      const totalParc = Number(selectedOrderModal.asaasTotalInstallments || selectedOrderModal.asaasInstallments || installmentsList.length || 1);
+                      const paidParc = Number(selectedOrderModal.asaasPaidInstallmentsCount || installmentsList.filter(i => i.paid).length || 0);
+
+                      return (
+                        <div className="pt-2 mt-2 border-t border-gray-200 space-y-1.5 text-[11px] text-gray-700">
+                          {selectedOrderModal.customerCpf && (
+                            <div className="flex justify-between">
+                              <span className="font-semibold text-gray-500">CPF/CNPJ:</span>
+                              <span className="font-bold text-gray-900">{selectedOrderModal.customerCpf}</span>
+                            </div>
+                          )}
+                          {selectedOrderModal.asaasBillingType && (
+                            <div className="flex justify-between">
+                              <span className="font-semibold text-gray-500">Meio de Pagamento:</span>
+                              <span className="font-bold text-gray-900">
+                                {selectedOrderModal.asaasBillingType === 'PIX'
+                                  ? 'Pix'
+                                  : selectedOrderModal.asaasBillingType === 'CREDIT_CARD'
+                                    ? `Cartão de Crédito (${totalParc}x)`
+                                    : selectedOrderModal.asaasBillingType === 'DEBIT_CARD'
+                                      ? 'Cartão de Débito'
+                                      : selectedOrderModal.asaasBillingType === 'BOLETO'
+                                        ? 'Boleto Bancário'
+                                        : selectedOrderModal.asaasBillingType}
+                              </span>
+                            </div>
+                          )}
+                          {typeof selectedOrderModal.depositAmount === 'number' && selectedOrderModal.depositAmount > 0 && (
+                            <div className="flex justify-between">
+                              <span className="font-semibold text-gray-500">Sinal Esperado (50%):</span>
+                              <span className="font-bold text-gray-900">
+                                {currencySymbol} {selectedOrderModal.depositAmount.toFixed(2).replace('.', ',')}
+                              </span>
+                            </div>
+                          )}
                           <div className="flex justify-between">
-                            <span className="font-semibold text-gray-500">CPF/CNPJ:</span>
-                            <span className="font-bold text-gray-900">{selectedOrderModal.customerCpf}</span>
-                          </div>
-                        )}
-                        {selectedOrderModal.asaasBillingType && (
-                          <div className="flex justify-between">
-                            <span className="font-semibold text-gray-500">Meio (Asaas):</span>
-                            <span className="font-bold text-gray-900">
-                              {selectedOrderModal.asaasBillingType === 'PIX'
-                                ? 'Pix'
-                                : selectedOrderModal.asaasBillingType === 'CREDIT_CARD'
-                                  ? `Cartão de Crédito (${selectedOrderModal.asaasInstallments || 1}x)`
-                                  : selectedOrderModal.asaasBillingType === 'DEBIT_CARD'
-                                    ? 'Cartão de Débito'
-                                    : selectedOrderModal.asaasBillingType === 'BOLETO'
-                                      ? 'Boleto Bancário'
-                                      : selectedOrderModal.asaasBillingType}
+                            <span className="font-semibold text-gray-500">Valor Pago Confirmado:</span>
+                            <span className={cn("font-extrabold", paidAmt > 0 ? "text-emerald-700" : "text-gray-500")}>
+                              {currencySymbol} {paidAmt.toFixed(2).replace('.', ',')} ({formatPercentLabel(paidPct)} do pedido)
                             </span>
                           </div>
-                        )}
-                        {typeof selectedOrderModal.depositAmount === 'number' && selectedOrderModal.depositAmount > 0 && (
-                          <div className="flex justify-between">
-                            <span className="font-semibold text-gray-500">Sinal 50%:</span>
-                            <span className="font-bold text-emerald-700">
-                              {currencySymbol} {selectedOrderModal.depositAmount.toFixed(2).replace('.', ',')}
-                            </span>
-                          </div>
-                        )}
-                        {selectedOrderModal.asaasStatus && (
-                          <div className="flex justify-between">
-                            <span className="font-semibold text-gray-500">Status Asaas:</span>
-                            <span className="font-bold text-gray-900">{selectedOrderModal.asaasStatus}</span>
-                          </div>
-                        )}
-                        {(() => {
-                          try {
-                            if (!selectedOrderModal.asaasInvoiceUrl) return null;
-                            const u = new URL(selectedOrderModal.asaasInvoiceUrl);
-                            const host = u.hostname.toLowerCase();
-                            if (u.protocol !== 'https:' || (host !== 'asaas.com' && !host.endsWith('.asaas.com'))) return null;
-                            return (
-                              <a
-                                href={u.toString()}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="mt-1.5 inline-flex items-center justify-center w-full py-1.5 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors"
+                          {totalParc > 1 && (
+                            <div className="flex justify-between">
+                              <span className="font-semibold text-gray-500">Parcelas Confirmadas:</span>
+                              <span className="font-bold text-gray-900">
+                                {paidParc} de {totalParc}
+                              </span>
+                            </div>
+                          )}
+                          {selectedOrderModal.asaasStatus && (
+                            <div className="flex justify-between">
+                              <span className="font-semibold text-gray-500">Status da Cobrança:</span>
+                              <span className="font-bold text-gray-900">{formatOnlineStatusPt(selectedOrderModal.asaasStatus)}</span>
+                            </div>
+                          )}
+
+                          {/* Detalhamento individual de cada parcela */}
+                          {installmentsList.length > 0 && (
+                            <div className="pt-1.5 mt-1 border-t border-gray-200/80 space-y-1">
+                              <span className="block text-[10px] font-extrabold uppercase text-gray-500">
+                                {installmentsList.length > 1 ? 'Detalhamento das Parcelas' : 'Detalhe da Cobrança'}
+                              </span>
+                              <div className="space-y-1">
+                                {installmentsList.map((inst) => (
+                                  <div
+                                    key={inst.id}
+                                    className={cn(
+                                      "flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg border text-[10px]",
+                                      inst.paid
+                                        ? "bg-emerald-50 border-emerald-200 text-emerald-950"
+                                        : inst.status === 'OVERDUE'
+                                          ? "bg-red-50 border-red-200 text-red-950"
+                                          : "bg-white border-gray-200 text-gray-700"
+                                    )}
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="font-bold">
+                                        {installmentsList.length > 1
+                                          ? `Parcela ${inst.installmentNumber}/${inst.totalInstallments}`
+                                          : 'Cobrança Única'}
+                                        {inst.dueDate ? ` • Venc. ${formatIsoDateBR(inst.dueDate)}` : ''}
+                                      </div>
+                                      <div className="text-[9px] opacity-80">
+                                        {inst.paid
+                                          ? `✅ ${formatOnlineStatusPt(inst.status)}${inst.confirmedDate ? ` em ${formatIsoDateBR(inst.confirmedDate)}` : ''}`
+                                          : `⏳ ${formatOnlineStatusPt(inst.status)}`}
+                                      </div>
+                                    </div>
+                                    <span className={cn("font-black shrink-0", inst.paid ? "text-emerald-700" : "text-gray-800")}>
+                                      {currencySymbol} {Number(inst.value || 0).toFixed(2).replace('.', ',')}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="flex flex-col gap-1.5 pt-1">
+                            {selectedOrderModal.asaasPaymentId && (
+                              <button
+                                type="button"
+                                onClick={() => syncOrderOnlinePayment(selectedOrderModal)}
+                                disabled={isSyncingOrderPayment}
+                                className="inline-flex items-center justify-center gap-1.5 w-full py-1.5 px-2.5 rounded-lg bg-gray-900 hover:bg-gray-800 text-white font-bold text-[11px] transition-colors cursor-pointer disabled:opacity-60"
                               >
-                                Abrir Fatura no Asaas
-                              </a>
-                            );
-                          } catch {
-                            return null;
-                          }
-                        })()}
-                      </div>
-                    )}
+                                <RefreshCw size={12} className={isSyncingOrderPayment ? 'animate-spin' : ''} />
+                                <span>{isSyncingOrderPayment ? 'Sincronizando...' : 'Atualizar Status e Parcelas'}</span>
+                              </button>
+                            )}
+                            {(() => {
+                              try {
+                                if (!selectedOrderModal.asaasInvoiceUrl) return null;
+                                const u = new URL(selectedOrderModal.asaasInvoiceUrl);
+                                const host = u.hostname.toLowerCase();
+                                if (u.protocol !== 'https:' || (host !== 'asaas.com' && !host.endsWith('.asaas.com'))) return null;
+                                return (
+                                  <a
+                                    href={u.toString()}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center justify-center gap-1.5 w-full py-1.5 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors"
+                                  >
+                                    <ExternalLink size={12} />
+                                    <span>Abrir Fatura / Comprovante</span>
+                                  </a>
+                                );
+                              } catch {
+                                return null;
+                              }
+                            })()}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>

@@ -139,6 +139,16 @@ function getHeader(req, name) {
   return Array.isArray(val) ? String(val[0] || '').trim() : String(val || '').trim();
 }
 
+function sanitizeCustomerErrorMessage(rawMessage, fallback) {
+  const msg = String(rawMessage || '').trim();
+  if (!msg) return fallback;
+  // Never expose gateway brand name in customer-facing checkout error text
+  if (/asaas/i.test(msg)) {
+    return msg.replace(/\bno\s+asaas\b/gi, 'de pagamento').replace(/\bdo\s+asaas\b/gi, 'de pagamento').replace(/\basaas\b/gi, 'pagamento');
+  }
+  return msg;
+}
+
 async function asaasRequest(apiKey, baseUrl, endpointPath, options = {}) {
   const url = `${baseUrl}${endpointPath}`;
   const res = await fetch(url, {
@@ -164,7 +174,7 @@ async function asaasRequest(apiKey, baseUrl, endpointPath, options = {}) {
     const firstError =
       Array.isArray(json?.errors) && json.errors[0]?.description
         ? String(json.errors[0].description)
-        : json?.message || `Erro HTTP ${res.status} na API do Asaas`;
+        : json?.message || `Erro HTTP ${res.status} ao processar pagamento`;
     const err = new Error(firstError);
     err.statusCode = res.status;
     err.details = json;
@@ -196,10 +206,16 @@ async function getFirestoreOrder(orderId) {
   return {
     exists: true,
     total: parseFirestoreNumber(fields.total),
+    depositAmount: parseFirestoreNumber(fields.depositAmount),
     paymentStatus:
       typeof fields.paymentStatus?.stringValue === 'string'
         ? fields.paymentStatus.stringValue
         : 'pending',
+    asaasInstallments: parseFirestoreNumber(fields.asaasInstallments),
+    asaasInstallmentId:
+      typeof fields.asaasInstallmentId?.stringValue === 'string'
+        ? fields.asaasInstallmentId.stringValue
+        : '',
   };
 }
 
@@ -279,36 +295,202 @@ async function findOrCreateAsaasCustomer(apiKey, baseUrl, customer) {
   });
 
   if (!created?.id) {
-    throw new Error('Não foi possível criar o cadastro do cliente no Asaas.');
+    throw new Error('Não foi possível criar o cadastro do cliente para cobrança.');
   }
 
   return String(created.id);
 }
 
-async function syncOrderPaymentFromAsaas(orderId, verifiedPayment) {
-  const status = String(verifiedPayment?.status || 'PENDING').toUpperCase();
-  const isPaid = PAID_ASAAS_STATUSES.has(status);
-  const existingOrder = await getFirestoreOrder(orderId);
-
-  let nextPaymentStatus = existingOrder.paymentStatus || 'pending';
-  if (isPaid && nextPaymentStatus !== 'full') {
-    nextPaymentStatus = 'half';
-  }
-
-  const updates = {
-    asaasStatus: status,
-    paymentStatus: nextPaymentStatus,
+/**
+ * Fetches all payment/installment records belonging to an order in Asaas
+ * and computes exact paid amount, exact % of order total, and per-installment breakdown.
+ */
+async function collectOrderPaymentSummary(apiKey, baseUrl, orderId, verifiedPayment, existingOrder) {
+  const paymentMap = new Map();
+  const addPayment = (p) => {
+    if (!p || typeof p !== 'object' || !p.id || p.deleted) return;
+    paymentMap.set(String(p.id), p);
   };
 
-  if (verifiedPayment?.id) {
-    updates.asaasPaymentId = String(verifiedPayment.id);
+  addPayment(verifiedPayment);
+
+  const resolvedInstallmentId =
+    (typeof verifiedPayment?.installment === 'string' && verifiedPayment.installment.trim()) ||
+    existingOrder?.asaasInstallmentId ||
+    '';
+
+  if (resolvedInstallmentId) {
+    try {
+      const byInstallment = await asaasRequest(
+        apiKey,
+        baseUrl,
+        `/payments?installment=${encodeURIComponent(resolvedInstallmentId)}&limit=50`,
+      );
+      if (Array.isArray(byInstallment?.data)) {
+        for (const p of byInstallment.data) addPayment(p);
+      }
+    } catch (err) {
+      console.warn('[Asaas] Aviso ao listar parcelas pelo installmentId:', err?.message || err);
+    }
   }
-  if (isPaid) {
+
+  if (orderId && VALID_DOC_ID_REGEX.test(orderId)) {
+    try {
+      const byRef = await asaasRequest(
+        apiKey,
+        baseUrl,
+        `/payments?externalReference=${encodeURIComponent(orderId)}&limit=50`,
+      );
+      if (Array.isArray(byRef?.data)) {
+        for (const p of byRef.data) addPayment(p);
+      }
+    } catch (err) {
+      console.warn('[Asaas] Aviso ao listar cobranças pelo externalReference:', err?.message || err);
+    }
+  }
+
+  let rawPayments = Array.from(paymentMap.values());
+
+  // If this payment is part of an installment plan, keep that installment group
+  // (plus any other already-paid payments on the same order so no received money is lost)
+  if (resolvedInstallmentId) {
+    const groupPayments = rawPayments.filter(
+      (p) =>
+        p.installment === resolvedInstallmentId ||
+        PAID_ASAAS_STATUSES.has(String(p.status || '').toUpperCase()),
+    );
+    if (groupPayments.length > 0) {
+      rawPayments = groupPayments;
+    }
+  }
+
+  rawPayments.sort((a, b) => {
+    const numA = Number(a.installmentNumber || 0);
+    const numB = Number(b.installmentNumber || 0);
+    if (numA !== numB) return numA - numB;
+    return String(a.dueDate || '').localeCompare(String(b.dueDate || ''));
+  });
+
+  const totalInstallments = Math.max(
+    rawPayments.length,
+    Number(verifiedPayment?.installmentCount || 0),
+    Number(existingOrder?.asaasInstallments || 0),
+    1,
+  );
+
+  const installments = rawPayments.map((p, idx) => {
+    const pStatus = String(p.status || 'PENDING').toUpperCase();
+    const isPaid = PAID_ASAAS_STATUSES.has(pStatus);
+    const confirmedDate =
+      typeof p.confirmedDate === 'string' && p.confirmedDate
+        ? p.confirmedDate
+        : typeof p.paymentDate === 'string' && p.paymentDate
+          ? p.paymentDate
+          : typeof p.clientPaymentDate === 'string' && p.clientPaymentDate
+            ? p.clientPaymentDate
+            : '';
+
+    return {
+      id: String(p.id),
+      installmentNumber: Number(p.installmentNumber || idx + 1),
+      totalInstallments,
+      value: Math.round(Number(p.value || 0) * 100) / 100,
+      dueDate: typeof p.dueDate === 'string' ? p.dueDate : '',
+      status: pStatus,
+      paid: isPaid,
+      confirmedDate,
+    };
+  });
+
+  const paidAmount =
+    Math.round(
+      installments.reduce((sum, item) => sum + (item.paid ? item.value : 0), 0) * 100,
+    ) / 100;
+  const paidInstallmentsCount = installments.filter((item) => item.paid).length;
+
+  const orderTotal = Math.round(Number(existingOrder?.total || 0) * 100) / 100;
+  const depositTarget =
+    orderTotal > 0
+      ? Math.round(orderTotal * 50) / 100
+      : Math.round(Number(existingOrder?.depositAmount || 0) * 100) / 100;
+
+  const paidPercent =
+    orderTotal > 0
+      ? Math.min(100, Math.round((paidAmount / orderTotal) * 1000) / 10)
+      : depositTarget > 0
+        ? Math.min(100, Math.round((paidAmount / (depositTarget * 2)) * 1000) / 10)
+        : 0;
+
+  const fullCompleted = orderTotal > 0 && paidAmount >= orderTotal - 0.05;
+  const depositCompleted = depositTarget > 0 && paidAmount >= depositTarget - 0.05;
+
+  let nextPaymentStatus = 'pending';
+  if (fullCompleted || existingOrder?.paymentStatus === 'full') {
+    nextPaymentStatus = 'full';
+  } else if (depositCompleted) {
+    nextPaymentStatus = 'half';
+  } else {
+    nextPaymentStatus = 'pending';
+  }
+
+  let summaryStatus = String(verifiedPayment?.status || 'PENDING').toUpperCase();
+  if (paidInstallmentsCount > 0 && !depositCompleted) {
+    summaryStatus = 'PARTIALLY_PAID';
+  } else if (depositCompleted) {
+    const allReceived = installments
+      .filter((i) => i.paid)
+      .every((i) => i.status === 'RECEIVED' || i.status === 'RECEIVED_IN_CASH');
+    summaryStatus = allReceived ? 'RECEIVED' : 'CONFIRMED';
+  }
+
+  return {
+    resolvedInstallmentId,
+    installments,
+    paidAmount,
+    paidPercent,
+    paidInstallmentsCount,
+    totalInstallments,
+    depositTarget,
+    depositCompleted,
+    fullCompleted,
+    nextPaymentStatus,
+    summaryStatus,
+    primaryPaymentId: installments[0]?.id || String(verifiedPayment?.id || ''),
+  };
+}
+
+async function syncOrderPaymentFromAsaas(apiKey, baseUrl, orderId, verifiedPayment) {
+  const existingOrder = await getFirestoreOrder(orderId);
+  const summary = await collectOrderPaymentSummary(
+    apiKey,
+    baseUrl,
+    orderId,
+    verifiedPayment,
+    existingOrder,
+  );
+
+  const updates = {
+    asaasStatus: summary.summaryStatus,
+    paymentStatus: summary.nextPaymentStatus,
+    asaasPaidAmount: summary.paidAmount,
+    asaasPaidPercent: summary.paidPercent,
+    asaasPaidInstallmentsCount: summary.paidInstallmentsCount,
+    asaasTotalInstallments: summary.totalInstallments,
+    asaasInstallmentsJson: JSON.stringify(summary.installments),
+  };
+
+  if (summary.primaryPaymentId) {
+    updates.asaasPaymentId = summary.primaryPaymentId;
+  }
+  if (summary.resolvedInstallmentId) {
+    updates.asaasInstallmentId = summary.resolvedInstallmentId;
+  }
+  if (summary.paidAmount > 0) {
     updates.asaasPaidAt = new Date().toISOString();
   }
 
   await patchFirestoreOrder(orderId, updates);
-  return nextPaymentStatus;
+  return summary;
 }
 
 export function handleAsaasConfig(req, res) {
@@ -334,7 +516,7 @@ export async function handleCreatePayment(req, res) {
     const apiKey = getAsaasApiKey();
     if (!apiKey) {
       return res.status(503).json({
-        error: 'Integração Asaas não configurada no servidor. Configure a variável ASAAS_API_KEY.',
+        error: 'Sistema de pagamento online não configurado no servidor.',
       });
     }
 
@@ -382,7 +564,7 @@ export async function handleCreatePayment(req, res) {
 
     if (depositAmount < 5) {
       return res.status(400).json({
-        error: 'O valor do sinal de 50% precisa ser de pelo menos R$ 5,00 para gerar cobrança no Asaas.',
+        error: 'O valor do sinal de 50% precisa ser de pelo menos R$ 5,00 para gerar cobrança online.',
       });
     }
 
@@ -427,7 +609,7 @@ export async function handleCreatePayment(req, res) {
 
     const paymentId = String(createdPayment.id || '');
     if (!paymentId || !VALID_PAYMENT_ID_REGEX.test(paymentId)) {
-      throw new Error('Resposta inesperada do Asaas ao gerar cobrança.');
+      throw new Error('Resposta inesperada ao gerar cobrança.');
     }
 
     let pixQrCodeImage = '';
@@ -469,24 +651,47 @@ export async function handleCreatePayment(req, res) {
 
     const invoiceUrl = isSafeAsaasUrl(createdPayment.invoiceUrl);
     const bankSlipUrl = isSafeAsaasUrl(createdPayment.bankSlipUrl);
-    const status = String(createdPayment.status || 'PENDING').toUpperCase();
 
-    await patchFirestoreOrder(orderId, {
+    const summary = await collectOrderPaymentSummary(
+      apiKey,
+      baseUrl,
+      orderId,
+      { ...createdPayment, installmentCount: parsedInstallments },
+      { ...savedOrder, total: totalAmount, depositAmount, asaasInstallments: parsedInstallments },
+    );
+
+    const firestoreUpdates = {
       customerCpf: stripNonDigits(cpfCnpj),
       depositAmount,
-      asaasPaymentId: paymentId,
-      asaasStatus: status,
+      asaasPaymentId: summary.primaryPaymentId || paymentId,
+      asaasStatus: summary.summaryStatus,
       asaasBillingType: billingType,
       asaasInstallments: parsedInstallments,
+      asaasPaidAmount: summary.paidAmount,
+      asaasPaidPercent: summary.paidPercent,
+      asaasPaidInstallmentsCount: summary.paidInstallmentsCount,
+      asaasTotalInstallments: summary.totalInstallments,
+      asaasInstallmentsJson: JSON.stringify(summary.installments),
       asaasInvoiceUrl: invoiceUrl,
       asaasBankSlipUrl: bankSlipUrl,
-      paymentStatus: PAID_ASAAS_STATUSES.has(status) ? 'half' : 'pending',
-    });
+      paymentStatus: summary.nextPaymentStatus,
+    };
+
+    if (summary.resolvedInstallmentId) {
+      firestoreUpdates.asaasInstallmentId = summary.resolvedInstallmentId;
+    }
+
+    await patchFirestoreOrder(orderId, firestoreUpdates);
 
     return res.status(200).json({
-      paymentId,
-      status,
-      paid: PAID_ASAAS_STATUSES.has(status),
+      paymentId: summary.primaryPaymentId || paymentId,
+      status: summary.summaryStatus,
+      paid: summary.depositCompleted,
+      paidAmount: summary.paidAmount,
+      paidPercent: summary.paidPercent,
+      paidInstallmentsCount: summary.paidInstallmentsCount,
+      totalInstallments: summary.totalInstallments,
+      installments: summary.installments,
       environment,
       billingType,
       installmentCount: parsedInstallments,
@@ -510,7 +715,7 @@ export async function handleCreatePayment(req, res) {
         ? err.statusCode
         : 500;
     return res.status(statusCode).json({
-      error: err?.message || 'Erro ao gerar cobrança no Asaas.',
+      error: sanitizeCustomerErrorMessage(err?.message, 'Erro ao gerar cobrança de pagamento.'),
     });
   }
 }
@@ -522,7 +727,7 @@ export async function handlePaymentStatus(req, res) {
   try {
     const apiKey = getAsaasApiKey();
     if (!apiKey) {
-      return res.status(503).json({ error: 'Asaas não configurado no servidor.' });
+      return res.status(503).json({ error: 'Sistema de pagamento não configurado no servidor.' });
     }
 
     const rawId = req.params?.paymentId ?? req.query?.paymentId ?? '';
@@ -533,27 +738,59 @@ export async function handlePaymentStatus(req, res) {
 
     const { baseUrl } = getAsaasConfig(apiKey);
     const payment = await asaasRequest(apiKey, baseUrl, `/payments/${encodeURIComponent(paymentId)}`);
-    const status = String(payment?.status || 'PENDING').toUpperCase();
-    const paid = PAID_ASAAS_STATUSES.has(status);
     const externalRef =
       typeof payment?.externalReference === 'string' ? payment.externalReference.trim() : '';
 
-    let orderPaymentStatus = paid ? 'half' : 'pending';
     if (externalRef && VALID_DOC_ID_REGEX.test(externalRef)) {
-      orderPaymentStatus = await syncOrderPaymentFromAsaas(externalRef, payment);
+      const summary = await syncOrderPaymentFromAsaas(apiKey, baseUrl, externalRef, payment);
+      return res.status(200).json({
+        paymentId: summary.primaryPaymentId || paymentId,
+        status: summary.summaryStatus,
+        paid: summary.depositCompleted,
+        orderPaymentStatus: summary.nextPaymentStatus,
+        paidAmount: summary.paidAmount,
+        paidPercent: summary.paidPercent,
+        paidInstallmentsCount: summary.paidInstallmentsCount,
+        totalInstallments: summary.totalInstallments,
+        installments: summary.installments,
+        invoiceUrl: isSafeAsaasUrl(payment?.invoiceUrl),
+        bankSlipUrl: isSafeAsaasUrl(payment?.bankSlipUrl),
+      });
     }
+
+    const status = String(payment?.status || 'PENDING').toUpperCase();
+    const paid = PAID_ASAAS_STATUSES.has(status);
+    const singleValue = Math.round(Number(payment?.value || 0) * 100) / 100;
 
     return res.status(200).json({
       paymentId,
       status,
       paid,
-      orderPaymentStatus,
+      orderPaymentStatus: paid ? 'half' : 'pending',
+      paidAmount: paid ? singleValue : 0,
+      paidPercent: paid ? 50 : 0,
+      paidInstallmentsCount: paid ? 1 : 0,
+      totalInstallments: 1,
+      installments: [
+        {
+          id: paymentId,
+          installmentNumber: Number(payment?.installmentNumber || 1),
+          totalInstallments: 1,
+          value: singleValue,
+          dueDate: typeof payment?.dueDate === 'string' ? payment.dueDate : '',
+          status,
+          paid,
+          confirmedDate: typeof payment?.confirmedDate === 'string' ? payment.confirmedDate : '',
+        },
+      ],
       invoiceUrl: isSafeAsaasUrl(payment?.invoiceUrl),
       bankSlipUrl: isSafeAsaasUrl(payment?.bankSlipUrl),
     });
   } catch (err) {
     console.error('[Asaas] Erro ao consultar status:', err?.message || err);
-    return res.status(500).json({ error: err?.message || 'Erro ao consultar status do pagamento.' });
+    return res.status(500).json({
+      error: sanitizeCustomerErrorMessage(err?.message, 'Erro ao consultar status do pagamento.'),
+    });
   }
 }
 
@@ -582,7 +819,7 @@ export async function handleAsaasWebhook(req, res) {
 
     const apiKey = getAsaasApiKey();
     if (!apiKey) {
-      return res.status(503).json({ error: 'Asaas API Key ausente no servidor.' });
+      return res.status(503).json({ error: 'Chave de pagamento ausente no servidor.' });
     }
 
     const { baseUrl } = getAsaasConfig(apiKey);
@@ -597,9 +834,9 @@ export async function handleAsaasWebhook(req, res) {
         : '';
 
     if (externalRef && VALID_DOC_ID_REGEX.test(externalRef)) {
-      await syncOrderPaymentFromAsaas(externalRef, verifiedPayment);
+      const summary = await syncOrderPaymentFromAsaas(apiKey, baseUrl, externalRef, verifiedPayment);
       console.log(
-        `[Asaas Webhook] Evento ${event} sincronizado para pedido ${externalRef} (status: ${verifiedPayment.status})`,
+        `[Asaas Webhook] Evento ${event} sincronizado para pedido ${externalRef}: pago R$ ${summary.paidAmount.toFixed(2)} (${summary.paidPercent}% | ${summary.paidInstallmentsCount}/${summary.totalInstallments} parcelas | status pedido: ${summary.nextPaymentStatus})`,
       );
     } else {
       console.log(`[Asaas Webhook] Evento ${event} recebido para pagamento ${paymentId} sem externalReference.`);

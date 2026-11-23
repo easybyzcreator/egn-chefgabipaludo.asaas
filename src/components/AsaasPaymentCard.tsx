@@ -13,11 +13,17 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import type { OrderInstallmentSummary } from '../types';
 
 export interface AsaasPaymentResult {
   paymentId: string;
   status: string;
   paid: boolean;
+  paidAmount?: number;
+  paidPercent?: number;
+  paidInstallmentsCount?: number;
+  totalInstallments?: number;
+  installments?: OrderInstallmentSummary[];
   environment?: 'sandbox' | 'production';
   billingType: 'PIX' | 'CREDIT_CARD' | 'DEBIT_CARD' | 'BOLETO' | string;
   installmentCount: number;
@@ -42,7 +48,15 @@ interface AsaasPaymentCardProps {
   primaryColor: string;
   currencySymbol: string;
   onRetry: () => void;
-  onStatusUpdate?: (updated: { status: string; paid: boolean }) => void;
+  onStatusUpdate?: (updated: {
+    status: string;
+    paid: boolean;
+    paidAmount?: number;
+    paidPercent?: number;
+    paidInstallmentsCount?: number;
+    totalInstallments?: number;
+    installments?: OrderInstallmentSummary[];
+  }) => void;
 }
 
 function getSafeExternalUrl(raw?: string): string {
@@ -86,6 +100,25 @@ function getBillingLabel(billingType: string, installments: number): string {
   }
 }
 
+function getFriendlyStatusLabel(status: string): string {
+  switch (status.toUpperCase()) {
+    case 'PENDING':
+      return 'Aguardando pagamento';
+    case 'PARTIALLY_PAID':
+      return 'Pagamento parcial';
+    case 'CONFIRMED':
+    case 'RECEIVED':
+    case 'RECEIVED_IN_CASH':
+      return 'Confirmado';
+    case 'OVERDUE':
+      return 'Vencido';
+    case 'REFUNDED':
+      return 'Estornado';
+    default:
+      return 'Em processamento';
+  }
+}
+
 export default function AsaasPaymentCard({
   payment,
   error,
@@ -99,11 +132,32 @@ export default function AsaasPaymentCard({
   const [isChecking, setIsChecking] = useState(false);
   const [isPaid, setIsPaid] = useState(Boolean(payment?.paid));
   const [currentStatus, setCurrentStatus] = useState(payment?.status || 'PENDING');
+  const [paidAmount, setPaidAmount] = useState(Number(payment?.paidAmount || 0));
+  const [paidPercent, setPaidPercent] = useState(Number(payment?.paidPercent || 0));
+  const [paidInstallmentsCount, setPaidInstallmentsCount] = useState(
+    Number(payment?.paidInstallmentsCount || 0),
+  );
+  const [totalInstallments, setTotalInstallments] = useState(
+    Number(payment?.totalInstallments || payment?.installmentCount || 1),
+  );
 
   useEffect(() => {
     setIsPaid(Boolean(payment?.paid));
     setCurrentStatus(payment?.status || 'PENDING');
-  }, [payment?.paymentId, payment?.paid, payment?.status]);
+    setPaidAmount(Number(payment?.paidAmount || 0));
+    setPaidPercent(Number(payment?.paidPercent || 0));
+    setPaidInstallmentsCount(Number(payment?.paidInstallmentsCount || 0));
+    setTotalInstallments(Number(payment?.totalInstallments || payment?.installmentCount || 1));
+  }, [
+    payment?.paymentId,
+    payment?.paid,
+    payment?.status,
+    payment?.paidAmount,
+    payment?.paidPercent,
+    payment?.paidInstallmentsCount,
+    payment?.totalInstallments,
+    payment?.installmentCount,
+  ]);
 
   const checkStatus = useCallback(
     async (manual = false) => {
@@ -124,12 +178,39 @@ export default function AsaasPaymentCard({
         if (data?.status) {
           setCurrentStatus(data.status);
         }
+        if (typeof data?.paidAmount === 'number') {
+          setPaidAmount(data.paidAmount);
+        }
+        if (typeof data?.paidPercent === 'number') {
+          setPaidPercent(data.paidPercent);
+        }
+        if (typeof data?.paidInstallmentsCount === 'number') {
+          setPaidInstallmentsCount(data.paidInstallmentsCount);
+        }
+        if (typeof data?.totalInstallments === 'number') {
+          setTotalInstallments(data.totalInstallments);
+        }
+
         if (data?.paid) {
           setIsPaid(true);
-          onStatusUpdate?.({ status: data.status, paid: true });
+          onStatusUpdate?.({
+            status: data.status,
+            paid: true,
+            paidAmount: data.paidAmount,
+            paidPercent: data.paidPercent,
+            paidInstallmentsCount: data.paidInstallmentsCount,
+            totalInstallments: data.totalInstallments,
+            installments: data.installments,
+          });
           toast.success('Pagamento do sinal de 50% confirmado com sucesso!');
         } else if (manual) {
-          toast.info('Pagamento ainda aguardando confirmação do Asaas.');
+          if (typeof data?.paidAmount === 'number' && data.paidAmount > 0) {
+            toast.info(
+              `Pagamento parcial identificado (${currencySymbol}${data.paidAmount.toFixed(2).replace('.', ',')} • ${data.paidInstallmentsCount || 1}/${data.totalInstallments || totalInstallments} parcelas). Aguardando confirmação do restante do sinal.`,
+            );
+          } else {
+            toast.info('Pagamento ainda aguardando confirmação.');
+          }
         }
       } catch {
         if (manual) {
@@ -139,7 +220,7 @@ export default function AsaasPaymentCard({
         if (manual) setIsChecking(false);
       }
     },
-    [payment?.paymentId, isPaid, onStatusUpdate],
+    [payment?.paymentId, isPaid, onStatusUpdate, currencySymbol, totalInstallments],
   );
 
   // Automatic status polling every 6 seconds while pending
@@ -170,7 +251,7 @@ export default function AsaasPaymentCard({
           <AlertCircle size={18} className="text-amber-700 shrink-0 mt-0.5" />
           <div className="space-y-1">
             <p className="text-xs font-extrabold uppercase text-amber-950">
-              Cobrança Asaas pendente
+              Cobrança pendente
             </p>
             <p className="text-xs text-amber-900 leading-relaxed">{error}</p>
           </div>
@@ -193,6 +274,7 @@ export default function AsaasPaymentCard({
   const safeInvoiceUrl = getSafeExternalUrl(payment.invoiceUrl);
   const safeBankSlipUrl = getSafeExternalUrl(payment.bankSlipUrl);
   const formattedDueDate = formatBrDate(payment.dueDate);
+  const hasPartialPayment = !isPaid && paidAmount > 0;
 
   return (
     <div className="p-4 rounded-2xl bg-white border-2 border-gray-200 text-left max-w-sm mx-auto space-y-4 shadow-sm font-sans">
@@ -215,11 +297,6 @@ export default function AsaasPaymentCard({
             </p>
           </div>
         </div>
-        {payment.environment === 'sandbox' && (
-          <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 border border-amber-300">
-            Sandbox
-          </span>
-        )}
       </div>
 
       {/* 50% Deposit Values */}
@@ -256,6 +333,18 @@ export default function AsaasPaymentCard({
         )}
       </div>
 
+      {/* Partial Payment Notice */}
+      {hasPartialPayment && (
+        <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 text-[11px] space-y-1">
+          <p className="font-extrabold">
+            Pagamento parcial identificado: {currencySymbol}{paidAmount.toFixed(2).replace('.', ',')} ({paidPercent.toFixed(1).replace('.0', '')}% do pedido)
+          </p>
+          <p className="text-amber-900 leading-relaxed">
+            {paidInstallmentsCount} de {totalInstallments} parcela(s) confirmada(s). Aguardando confirmação das demais parcelas para concluir o sinal de 50%.
+          </p>
+        </div>
+      )}
+
       {/* Paid State */}
       {isPaid ? (
         <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-center space-y-1.5">
@@ -276,7 +365,7 @@ export default function AsaasPaymentCard({
                 <div className="flex flex-col items-center p-3 bg-white rounded-xl border border-gray-200">
                   <img
                     src={`data:image/png;base64,${payment.pixQrCodeImage}`}
-                    alt="QR Code Pix Asaas"
+                    alt="QR Code Pix"
                     className="w-44 h-44 object-contain"
                   />
                   <p className="text-[10px] text-gray-500 mt-1.5 text-center">
@@ -319,7 +408,7 @@ export default function AsaasPaymentCard({
                   className="flex items-center justify-center gap-1.5 w-full py-2.5 px-3 rounded-xl border border-gray-300 text-xs font-bold text-gray-800 hover:bg-gray-50 transition-colors"
                 >
                   <ExternalLink size={13} />
-                  <span>Abrir Fatura Pix no Asaas</span>
+                  <span>Abrir Página de Pagamento Pix</span>
                 </a>
               )}
             </div>
@@ -374,8 +463,8 @@ export default function AsaasPaymentCard({
             <div className="space-y-2.5">
               <p className="text-[11px] text-gray-700 leading-relaxed">
                 {payment.billingType === 'DEBIT_CARD'
-                  ? 'Para sua segurança (autenticação bancária 3DS), finalize o pagamento no cartão de débito na página segura do Asaas:'
-                  : `Clique no botão abaixo para informar os dados do seu cartão de crédito${payment.installmentCount > 1 ? ` em ${payment.installmentCount}x` : ''} na página segura do Asaas:`}
+                  ? 'Para sua segurança (autenticação bancária 3DS), finalize o pagamento no cartão de débito na página segura de pagamento:'
+                  : `Clique no botão abaixo para informar os dados do seu cartão de crédito${payment.installmentCount > 1 ? ` em ${payment.installmentCount}x` : ''} na página segura de pagamento:`}
               </p>
 
               {safeInvoiceUrl && (
@@ -389,8 +478,8 @@ export default function AsaasPaymentCard({
                   <CreditCard size={15} />
                   <span>
                     {payment.billingType === 'DEBIT_CARD'
-                      ? 'Pagar Sinal no Débito (Asaas)'
-                      : 'Pagar Sinal no Crédito (Asaas)'}
+                      ? 'Pagar Sinal no Débito'
+                      : 'Pagar Sinal no Crédito'}
                   </span>
                   <ExternalLink size={13} />
                 </a>
@@ -402,7 +491,7 @@ export default function AsaasPaymentCard({
           <div className="pt-2 border-t border-gray-100 flex items-center justify-between gap-2">
             <span className="text-[10px] text-gray-500 flex items-center gap-1">
               <ShieldCheck size={12} className="text-emerald-600" />
-              Status: <strong className="text-gray-800">{currentStatus === 'PENDING' ? 'Aguardando pagamento' : currentStatus}</strong>
+              Status: <strong className="text-gray-800">{getFriendlyStatusLabel(currentStatus)}</strong>
             </span>
             <button
               type="button"

@@ -1435,7 +1435,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         createdAsaasPayment = asaasResult.payment;
         setAsaasPayment(createdAsaasPayment);
       } else {
-        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança no Asaas.');
+        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança. Tente novamente abaixo.');
       }
 
       // Decrementar estoque de produtos que possuem controle de quantidade
@@ -1562,7 +1562,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       message += `*Forma de Pagamento (Sinal 50%):* ${paymentMethodLabel}\n`;
       message += `*Valor do Sinal (50%):* ${currencySymbol}${depositAmount.toFixed(2)}\n`;
       if (createdAsaasPayment?.invoiceUrl) {
-        message += `*Link do Pagamento (Asaas):* ${createdAsaasPayment.invoiceUrl}\n`;
+        message += `*Link do Pagamento:* ${createdAsaasPayment.invoiceUrl}\n`;
       }
       
       if (hasConsultItems) {
@@ -1607,7 +1607,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     payload: Record<string, unknown>
   ): Promise<{ payment: AsaasPaymentResult | null; error: string | null }> => {
     const maxAttempts = 3;
-    let lastError = 'Erro de conexão ao gerar cobrança no Asaas. Tente novamente abaixo.';
+    let lastError = 'Erro de conexão ao gerar cobrança. Tente novamente abaixo.';
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -1639,7 +1639,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
         lastError =
           payJson?.error ||
-          `Não foi possível gerar a cobrança no Asaas (HTTP ${payRes.status}). Tente novamente abaixo.`;
+          `Não foi possível gerar a cobrança (HTTP ${payRes.status}). Tente novamente abaixo.`;
         return { payment: null, error: lastError };
       } catch (err) {
         console.error(`Erro ao chamar API Asaas (tentativa ${attempt}):`, err);
@@ -1683,7 +1683,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         setAsaasPayment(asaasResult.payment);
         toast.success('Cobrança de 50% gerada com sucesso!');
       } else {
-        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança no Asaas.');
+        setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança. Tente novamente abaixo.');
       }
     } finally {
       setIsRetryingAsaas(false);
@@ -2892,7 +2892,16 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       currencySymbol={currencySymbol}
                       onRetry={handleRetryAsaasPayment}
                       onStatusUpdate={(upd) => {
-                        setAsaasPayment(prev => prev ? { ...prev, status: upd.status, paid: upd.paid } : prev);
+                        setAsaasPayment(prev => prev ? {
+                          ...prev,
+                          status: upd.status,
+                          paid: upd.paid,
+                          paidAmount: upd.paidAmount ?? prev.paidAmount,
+                          paidPercent: upd.paidPercent ?? prev.paidPercent,
+                          paidInstallmentsCount: upd.paidInstallmentsCount ?? prev.paidInstallmentsCount,
+                          totalInstallments: upd.totalInstallments ?? prev.totalInstallments,
+                          installments: upd.installments ?? prev.installments,
+                        } : prev);
                       }}
                     />
 

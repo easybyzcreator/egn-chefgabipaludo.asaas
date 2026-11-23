@@ -109,6 +109,17 @@ export interface CartItem {
   };
 }
 
+export interface OrderInstallmentSummary {
+  id: string;
+  installmentNumber: number;
+  totalInstallments: number;
+  value: number;
+  dueDate: string;
+  status: string;
+  paid: boolean;
+  confirmedDate?: string;
+}
+
 export interface Order {
   id: string;
   customerName: string;
@@ -174,9 +185,15 @@ export interface Order {
   customerCpf?: string;
   depositAmount?: number;
   asaasPaymentId?: string;
+  asaasInstallmentId?: string;
   asaasStatus?: string;
   asaasBillingType?: 'PIX' | 'CREDIT_CARD' | 'DEBIT_CARD' | 'BOLETO' | string;
   asaasInstallments?: number;
+  asaasPaidAmount?: number;
+  asaasPaidPercent?: number;
+  asaasPaidInstallmentsCount?: number;
+  asaasTotalInstallments?: number;
+  asaasInstallmentsJson?: string;
   asaasInvoiceUrl?: string;
   asaasBankSlipUrl?: string;
   asaasPaidAt?: string;
