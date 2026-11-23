@@ -188,6 +188,7 @@ export interface Order {
   asaasInstallmentId?: string;
   asaasStatus?: string;
   asaasBillingType?: 'PIX' | 'CREDIT_CARD' | 'DEBIT_CARD' | 'BOLETO' | string;
+  asaasPaymentPlan?: 'half' | 'full';
   asaasInstallments?: number;
   asaasPaidAmount?: number;
   asaasPaidPercent?: number;

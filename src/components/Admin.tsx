@@ -10563,7 +10563,11 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                           )}
                           {typeof selectedOrderModal.depositAmount === 'number' && selectedOrderModal.depositAmount > 0 && (
                             <div className="flex justify-between">
-                              <span className="font-semibold text-gray-500">Sinal Esperado (50%):</span>
+                              <span className="font-semibold text-gray-500">
+                                {selectedOrderModal.asaasPaymentPlan === 'full'
+                                  ? 'Cobrança Gerada (Integral 100%):'
+                                  : 'Sinal Esperado (50%):'}
+                              </span>
                               <span className="font-bold text-gray-900">
                                 {currencySymbol} {selectedOrderModal.depositAmount.toFixed(2).replace('.', ',')}
                               </span>

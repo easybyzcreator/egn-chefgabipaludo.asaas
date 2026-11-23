@@ -4,6 +4,7 @@ const FIREBASE_PROJECT_ID = 'app-egn-c-asaas';
 const FIRESTORE_BASE_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 
 const ALLOWED_BILLING_TYPES = new Set(['PIX', 'CREDIT_CARD', 'DEBIT_CARD', 'BOLETO']);
+const ALLOWED_PAYMENT_PLANS = new Set(['half', 'full']);
 const PAID_ASAAS_STATUSES = new Set(['RECEIVED', 'CONFIRMED', 'RECEIVED_IN_CASH']);
 const VALID_DOC_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
 const VALID_PAYMENT_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -212,6 +213,8 @@ async function getFirestoreOrder(orderId) {
         ? fields.paymentStatus.stringValue
         : 'pending',
     asaasInstallments: parseFirestoreNumber(fields.asaasInstallments),
+    asaasPaymentPlan:
+      fields.asaasPaymentPlan?.stringValue === 'full' ? 'full' : 'half',
     asaasInstallmentId:
       typeof fields.asaasInstallmentId?.stringValue === 'string'
         ? fields.asaasInstallmentId.stringValue
@@ -409,34 +412,40 @@ async function collectOrderPaymentSummary(apiKey, baseUrl, orderId, verifiedPaym
   const paidInstallmentsCount = installments.filter((item) => item.paid).length;
 
   const orderTotal = Math.round(Number(existingOrder?.total || 0) * 100) / 100;
-  const depositTarget =
+  const paymentPlan = existingOrder?.asaasPaymentPlan === 'full' ? 'full' : 'half';
+  const halfTarget =
     orderTotal > 0
       ? Math.round(orderTotal * 50) / 100
       : Math.round(Number(existingOrder?.depositAmount || 0) * 100) / 100;
+  const chargeTarget =
+    paymentPlan === 'full' && orderTotal > 0
+      ? orderTotal
+      : halfTarget;
 
   const paidPercent =
     orderTotal > 0
       ? Math.min(100, Math.round((paidAmount / orderTotal) * 1000) / 10)
-      : depositTarget > 0
-        ? Math.min(100, Math.round((paidAmount / (depositTarget * 2)) * 1000) / 10)
+      : halfTarget > 0
+        ? Math.min(100, Math.round((paidAmount / (halfTarget * 2)) * 1000) / 10)
         : 0;
 
   const fullCompleted = orderTotal > 0 && paidAmount >= orderTotal - 0.05;
-  const depositCompleted = depositTarget > 0 && paidAmount >= depositTarget - 0.05;
+  const halfCompleted = halfTarget > 0 && paidAmount >= halfTarget - 0.05;
+  const chargeCompleted = chargeTarget > 0 && paidAmount >= chargeTarget - 0.05;
 
   let nextPaymentStatus = 'pending';
   if (fullCompleted || existingOrder?.paymentStatus === 'full') {
     nextPaymentStatus = 'full';
-  } else if (depositCompleted) {
+  } else if (halfCompleted) {
     nextPaymentStatus = 'half';
   } else {
     nextPaymentStatus = 'pending';
   }
 
   let summaryStatus = String(verifiedPayment?.status || 'PENDING').toUpperCase();
-  if (paidInstallmentsCount > 0 && !depositCompleted) {
+  if (paidInstallmentsCount > 0 && !chargeCompleted) {
     summaryStatus = 'PARTIALLY_PAID';
-  } else if (depositCompleted) {
+  } else if (chargeCompleted) {
     const allReceived = installments
       .filter((i) => i.paid)
       .every((i) => i.status === 'RECEIVED' || i.status === 'RECEIVED_IN_CASH');
@@ -445,13 +454,14 @@ async function collectOrderPaymentSummary(apiKey, baseUrl, orderId, verifiedPaym
 
   return {
     resolvedInstallmentId,
+    paymentPlan,
     installments,
     paidAmount,
     paidPercent,
     paidInstallmentsCount,
     totalInstallments,
-    depositTarget,
-    depositCompleted,
+    depositTarget: chargeTarget,
+    depositCompleted: chargeCompleted,
     fullCompleted,
     nextPaymentStatus,
     summaryStatus,
@@ -531,6 +541,7 @@ export async function handleCreatePayment(req, res) {
       number,
       neighborhood,
       billingType,
+      paymentPlan: rawPaymentPlan,
       installmentCount,
       brandName,
     } = body;
@@ -548,6 +559,11 @@ export async function handleCreatePayment(req, res) {
       return res.status(400).json({ error: 'Forma de pagamento inválida.' });
     }
 
+    const paymentPlan =
+      typeof rawPaymentPlan === 'string' && ALLOWED_PAYMENT_PLANS.has(rawPaymentPlan)
+        ? rawPaymentPlan
+        : 'half';
+
     const parsedInstallments =
       billingType === 'CREDIT_CARD'
         ? Math.min(2, Math.max(1, Math.floor(Number(installmentCount) || 1)))
@@ -559,12 +575,14 @@ export async function handleCreatePayment(req, res) {
     }
 
     const totalAmount = Math.round(savedOrder.total * 100) / 100;
-    const depositAmount = Math.round(totalAmount * 50) / 100;
-    const remainingAmount = Math.round((totalAmount - depositAmount) * 100) / 100;
+    const depositAmount =
+      paymentPlan === 'full' ? totalAmount : Math.round(totalAmount * 50) / 100;
+    const remainingAmount =
+      paymentPlan === 'full' ? 0 : Math.round((totalAmount - depositAmount) * 100) / 100;
 
     if (depositAmount < 5) {
       return res.status(400).json({
-        error: 'O valor do sinal de 50% precisa ser de pelo menos R$ 5,00 para gerar cobrança online.',
+        error: 'O valor da cobrança precisa ser de pelo menos R$ 5,00 para pagamento online.',
       });
     }
 
@@ -586,12 +604,13 @@ export async function handleCreatePayment(req, res) {
 
     // Asaas API v3 accepts DEBIT_CARD via hosted invoice page (billingType: 'UNDEFINED') with 3DS
     const asaasBillingType = billingType === 'DEBIT_CARD' ? 'UNDEFINED' : billingType;
+    const planDescription = paymentPlan === 'full' ? 'Pagamento Integral 100%' : 'Sinal 50%';
 
     const paymentBody = {
       customer: customerId,
       billingType: asaasBillingType,
       dueDate,
-      description: `Sinal 50% - Pedido #${shortOrderCode} - ${safeBrand}`,
+      description: `${planDescription} - Pedido #${shortOrderCode} - ${safeBrand}`,
       externalReference: orderId,
     };
 
@@ -657,7 +676,13 @@ export async function handleCreatePayment(req, res) {
       baseUrl,
       orderId,
       { ...createdPayment, installmentCount: parsedInstallments },
-      { ...savedOrder, total: totalAmount, depositAmount, asaasInstallments: parsedInstallments },
+      {
+        ...savedOrder,
+        total: totalAmount,
+        depositAmount,
+        asaasPaymentPlan: paymentPlan,
+        asaasInstallments: parsedInstallments,
+      },
     );
 
     const firestoreUpdates = {
@@ -666,6 +691,7 @@ export async function handleCreatePayment(req, res) {
       asaasPaymentId: summary.primaryPaymentId || paymentId,
       asaasStatus: summary.summaryStatus,
       asaasBillingType: billingType,
+      asaasPaymentPlan: paymentPlan,
       asaasInstallments: parsedInstallments,
       asaasPaidAmount: summary.paidAmount,
       asaasPaidPercent: summary.paidPercent,
@@ -687,6 +713,7 @@ export async function handleCreatePayment(req, res) {
       paymentId: summary.primaryPaymentId || paymentId,
       status: summary.summaryStatus,
       paid: summary.depositCompleted,
+      paymentPlan,
       paidAmount: summary.paidAmount,
       paidPercent: summary.paidPercent,
       paidInstallmentsCount: summary.paidInstallmentsCount,
@@ -747,6 +774,7 @@ export async function handlePaymentStatus(req, res) {
         paymentId: summary.primaryPaymentId || paymentId,
         status: summary.summaryStatus,
         paid: summary.depositCompleted,
+        paymentPlan: summary.paymentPlan,
         orderPaymentStatus: summary.nextPaymentStatus,
         paidAmount: summary.paidAmount,
         paidPercent: summary.paidPercent,

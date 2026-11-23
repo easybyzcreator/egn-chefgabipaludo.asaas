@@ -463,6 +463,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     scheduledDate: '',
     scheduledTime: '',
     paymentMethod: 'PIX' as 'PIX' | 'CREDIT_CARD' | 'DEBIT_CARD' | 'BOLETO',
+    paymentPlan: 'half' as 'half' | 'full',
     installments: 1
   });
 
@@ -753,6 +754,60 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         return prev.map(item => item === existing ? { ...item, quantity: item.quantity + customQty } : item);
       }
       return [...prev, { id: Math.random().toString(36).substr(2, 9), productId: product.id, quantity: customQty }];
+    });
+  };
+
+  // Adição rápida direta pelo botão "+" no card do cardápio (sem abrir tela de detalhes)
+  const quickAddToCart = (product: Product) => {
+    const defaultSize = product.sizes && product.sizes.length > 0 ? product.sizes[0] : undefined;
+
+    if (defaultSize && typeof defaultSize.stockQuantity === 'number') {
+      const currentInCartForSize = cart
+        .filter(item => item.productId === product.id && item.selectedSize?.id === defaultSize.id)
+        .reduce((sum, item) => sum + item.quantity, 0);
+      if (defaultSize.stockQuantity <= 0) {
+        toast.error(`Desculpe, o tamanho ${defaultSize.name} está esgotado no momento!`);
+        return;
+      }
+      if (currentInCartForSize + 1 > defaultSize.stockQuantity) {
+        toast.error(`Quantidade máxima disponível para ${defaultSize.name} atingida! (Restam ${Math.max(0, defaultSize.stockQuantity - currentInCartForSize)})`);
+        return;
+      }
+    } else if (product.trackStock) {
+      const currentInCart = cart.filter(item => item.productId === product.id).reduce((sum, item) => sum + item.quantity, 0);
+      const maxStock = Number(product.stockQuantity ?? 0);
+      if (maxStock <= 0) {
+        toast.error('Desculpe, este item está esgotado no momento!');
+        return;
+      }
+      if (currentInCart + 1 > maxStock) {
+        toast.error(`Quantidade máxima disponível em estoque atingida! (Restam ${Math.max(0, maxStock - currentInCart)})`);
+        return;
+      }
+    }
+
+    setCart(prev => {
+      const existing = prev.find(
+        item =>
+          item.productId === product.id &&
+          !item.mealOptions &&
+          !item.cakeOptions &&
+          !item.sandwichOptions &&
+          !item.comboOptions &&
+          (defaultSize ? item.selectedSize?.id === defaultSize.id : !item.selectedSize)
+      );
+      if (existing) {
+        return prev.map(item => (item === existing ? { ...item, quantity: item.quantity + 1 } : item));
+      }
+      return [
+        ...prev,
+        {
+          id: Math.random().toString(36).substr(2, 9),
+          productId: product.id,
+          quantity: 1,
+          ...(defaultSize ? { selectedSize: defaultSize } : {}),
+        },
+      ];
     });
   };
 
@@ -1371,7 +1426,10 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         ? `${formattedDateOnly} (${formData.deliveryOption === 'delivery' ? 'DELIVERY' : 'RETIRADA'})` 
         : '';
 
-      const depositAmount = Math.round(finalTotalWithDelivery * 50) / 100;
+      const isFullPayment = formData.paymentPlan === 'full';
+      const depositAmount = isFullPayment
+        ? Math.round(finalTotalWithDelivery * 100) / 100
+        : Math.round(finalTotalWithDelivery * 50) / 100;
       const selectedInstallments = formData.paymentMethod === 'CREDIT_CARD'
         ? Math.min(2, Math.max(1, Number(formData.installments) || 1))
         : 1;
@@ -1402,6 +1460,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         subtotal: cartTotal,
         depositAmount,
         asaasBillingType: formData.paymentMethod,
+        asaasPaymentPlan: formData.paymentPlan,
         asaasInstallments: selectedInstallments,
         paymentStatus: 'pending',
         taxRate: 0,
@@ -1414,7 +1473,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       const orderRef = await addDoc(collection(db, 'pedidos'), orderData);
       setLastCreatedOrderId(orderRef.id);
 
-      // Gerar cobrança de 50% de sinal no Asaas via servidor (com retry automático em caso de despertar do servidor)
+      // Gerar cobrança online via servidor (com retry automático em caso de despertar do servidor)
       let createdAsaasPayment: AsaasPaymentResult | null = null;
       setAsaasPayment(null);
       setAsaasError(null);
@@ -1428,6 +1487,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         number: formData.number,
         neighborhood: neighborhoodName,
         billingType: formData.paymentMethod,
+        paymentPlan: formData.paymentPlan,
         installmentCount: selectedInstallments,
         brandName: settings.brandName || settings.slug,
       });
@@ -1559,8 +1619,8 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         message += `*Taxa de Entrega (${neighborhoodName}):* ${deliveryFee > 0 ? `${currencySymbol}${deliveryFee.toFixed(2)}` : (formData.neighborhood === 'Outro' ? 'A combinar' : 'Grátis')}\n`;
       }
       message += `*${t.whatsappTotal}:* ${currencySymbol}${finalTotalWithDelivery.toFixed(2)}\n`;
-      message += `*Forma de Pagamento (Sinal 50%):* ${paymentMethodLabel}\n`;
-      message += `*Valor do Sinal (50%):* ${currencySymbol}${depositAmount.toFixed(2)}\n`;
+      message += `*Forma de Pagamento (${isFullPayment ? 'Integral 100%' : 'Sinal 50%'}):* ${paymentMethodLabel}\n`;
+      message += `*${isFullPayment ? 'Valor Pago Agora (100%)' : 'Valor do Sinal (50%)'}:* ${currencySymbol}${depositAmount.toFixed(2)}\n`;
       if (createdAsaasPayment?.invoiceUrl) {
         message += `*Link do Pagamento:* ${createdAsaasPayment.invoiceUrl}\n`;
       }
@@ -1592,7 +1652,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       setHasRedirected(false);
       toast.success(
         createdAsaasPayment
-          ? 'Pedido salvo e cobrança de 50% gerada!'
+          ? (isFullPayment ? 'Pedido salvo e cobrança integral gerada!' : 'Pedido salvo e cobrança de 50% gerada!')
           : (settings.language === 'en' ? 'Order saved! Select your dispatch method below.' : 'Pedido salvo! Confira o pagamento e envio abaixo.')
       );
     } catch (error) {
@@ -1675,13 +1735,18 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
         number: formData.number,
         neighborhood: neighborhoodName,
         billingType: formData.paymentMethod,
+        paymentPlan: formData.paymentPlan,
         installmentCount: selectedInstallments,
         brandName: settings.brandName || settings.slug,
       });
 
       if (asaasResult.payment) {
         setAsaasPayment(asaasResult.payment);
-        toast.success('Cobrança de 50% gerada com sucesso!');
+        toast.success(
+          formData.paymentPlan === 'full'
+            ? 'Cobrança integral gerada com sucesso!'
+            : 'Cobrança de 50% gerada com sucesso!'
+        );
       } else {
         setAsaasError(asaasResult.error || 'Não foi possível gerar a cobrança. Tente novamente abaixo.');
       }
@@ -1717,6 +1782,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       scheduledDate: '',
       scheduledTime: '',
       paymentMethod: 'PIX',
+      paymentPlan: 'half',
       installments: 1
     });
   };
@@ -2062,27 +2128,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       initial={{ opacity: 0, y: 20 }}
                       whileInView={{ opacity: 1, y: 0 }}
                       viewport={{ once: true }}
-                      onClick={(e) => {
-                        // If user click is inside the cart button container, don't trigger card action
-                        if ((e.target as HTMLElement).closest('.cart-button-area')) {
-                          return;
-                        }
-                        
-                        if (product.isCombo) {
-                          setSelectedComboProduct(product);
-                          setComboDishSelections({});
-                          setComboSearchTerm('');
-                          return;
-                        }
-
-                        setSelectedProductForDetails(product);
-                        if (product.sizes && product.sizes.length > 0) {
-                          setSelectedSize(product.sizes[0]);
-                        } else {
-                          setSelectedSize(null);
-                        }
-                      }}
-                      className="glass rounded-2xl p-3.5 sm:p-4 md:p-5 flex gap-3.5 sm:gap-4 items-start sm:items-center cursor-pointer hover:shadow-md transition-all duration-300 w-full"
+                      className="glass rounded-2xl p-3.5 sm:p-4 md:p-5 flex gap-3.5 sm:gap-4 items-start sm:items-center hover:shadow-md transition-all duration-300 w-full"
                     >
                       <div className="w-20 h-20 sm:w-24 sm:h-24 md:w-28 md:h-28 rounded-xl overflow-hidden flex-shrink-0 bg-white/50 shadow-sm border border-black/5 self-start sm:self-center">
                         <img 
@@ -2213,108 +2259,55 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                                 );
                               }
 
-                              const requiresCustomization = !!((product.sizes && product.sizes.length > 0) || product.isCustomCake || product.isMeal);
                               const totalQty = cart.filter(item => item.productId === product.id).reduce((sum, item) => sum + item.quantity, 0);
 
-                              if (requiresCustomization) {
-                                if (totalQty > 0) {
-                                  return (
-                                    <div className="flex items-center gap-1 bg-white/75 backdrop-blur-sm p-1 rounded-full border border-black/10 shadow-md">
-                                      <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          const productCartItems = cart.filter(item => item.productId === product.id);
-                                          if (productCartItems.length > 0) {
-                                            const lastItem = productCartItems[productCartItems.length - 1];
-                                            removeFromCart(lastItem.id);
-                                          }
-                                        }}
-                                        className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white hover:bg-gray-100 flex items-center justify-center shadow-sm border border-gray-200 cursor-pointer active:scale-95 transition-all text-black focus:outline-none"
-                                      >
-                                        <Minus size={12} />
-                                      </button>
-                                      <span className="font-bold text-xs sm:text-sm min-w-[14px] sm:min-w-[20px] text-center text-black">
-                                        {totalQty}
-                                      </span>
-                                      <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setSelectedProductForDetails(product);
-                                          if (product.sizes && product.sizes.length > 0) {
-                                            setSelectedSize(product.sizes[0]);
-                                          } else {
-                                            setSelectedSize(null);
-                                          }
-                                        }}
-                                        className="w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center shadow-md cursor-pointer active:scale-95 transition-all focus:outline-none"
-                                        style={{ backgroundColor: settings.primaryColor, color: getContrastText(settings.primaryColor) }}
-                                      >
-                                        <Plus size={12} />
-                                      </button>
-                                    </div>
-                                  );
-                                } else {
-                                  return (
+                              if (totalQty > 0) {
+                                return (
+                                  <div className="flex items-center gap-1 bg-white/75 backdrop-blur-sm p-1 rounded-full border border-black/10 shadow-md">
                                     <button 
+                                      type="button"
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        setSelectedProductForDetails(product);
-                                        if (product.sizes && product.sizes.length > 0) {
-                                          setSelectedSize(product.sizes[0]);
-                                        } else {
-                                          setSelectedSize(null);
+                                        const productCartItems = cart.filter(item => item.productId === product.id);
+                                        if (productCartItems.length > 0) {
+                                          const lastItem = productCartItems[productCartItems.length - 1];
+                                          removeFromCart(lastItem.id);
                                         }
                                       }}
-                                      className="w-8 h-8 sm:w-10 sm:h-10 rounded-full shadow-lg font-bold hover:scale-105 active:scale-95 transition-all cursor-pointer flex items-center justify-center focus:outline-none"
-                                      style={{ backgroundColor: settings.primaryColor, color: getContrastText(settings.primaryColor) }}
+                                      className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white hover:bg-gray-100 flex items-center justify-center shadow-sm border border-gray-200 cursor-pointer active:scale-95 transition-all text-black focus:outline-none"
                                     >
-                                      <Plus size={16} />
+                                      <Minus size={12} />
                                     </button>
-                                  );
-                                }
-                              } else {
-                                if (totalQty > 0) {
-                                  return (
-                                    <div className="flex items-center gap-1 bg-white/75 backdrop-blur-sm p-1 rounded-full border border-black/10 shadow-md">
-                                      <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          const item = cart.find(i => i.productId === product.id);
-                                          if (item) removeFromCart(item.id);
-                                        }}
-                                        className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white hover:bg-gray-100 flex items-center justify-center shadow-sm border border-gray-200 cursor-pointer active:scale-95 transition-all text-black focus:outline-none"
-                                      >
-                                        <Minus size={12} />
-                                      </button>
-                                      <span className="font-bold text-xs sm:text-sm min-w-[14px] sm:min-w-[20px] text-center text-black">
-                                        {totalQty}
-                                      </span>
-                                      <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          addToCart(product);
-                                        }}
-                                        className="w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center shadow-md cursor-pointer active:scale-95 transition-all focus:outline-none"
-                                        style={{ backgroundColor: settings.primaryColor, color: getContrastText(settings.primaryColor) }}
-                                      >
-                                        <Plus size={12} />
-                                      </button>
-                                    </div>
-                                  );
-                                } else {
-                                  return (
+                                    <span className="font-bold text-xs sm:text-sm min-w-[14px] sm:min-w-[20px] text-center text-black">
+                                      {totalQty}
+                                    </span>
                                     <button 
+                                      type="button"
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        addToCart(product);
+                                        quickAddToCart(product);
                                       }}
-                                      className="w-8 h-8 sm:w-10 sm:h-10 rounded-full shadow-lg font-bold hover:scale-105 active:scale-95 transition-all cursor-pointer flex items-center justify-center focus:outline-none"
+                                      className="w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center shadow-md cursor-pointer active:scale-95 transition-all focus:outline-none"
                                       style={{ backgroundColor: settings.primaryColor, color: getContrastText(settings.primaryColor) }}
                                     >
-                                      <Plus size={16} />
+                                      <Plus size={12} />
                                     </button>
-                                  );
-                                }
+                                  </div>
+                                );
+                              } else {
+                                return (
+                                  <button 
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      quickAddToCart(product);
+                                    }}
+                                    className="w-8 h-8 sm:w-10 sm:h-10 rounded-full shadow-lg font-bold hover:scale-105 active:scale-95 transition-all cursor-pointer flex items-center justify-center focus:outline-none"
+                                    style={{ backgroundColor: settings.primaryColor, color: getContrastText(settings.primaryColor) }}
+                                  >
+                                    <Plus size={16} />
+                                  </button>
+                                );
                               }
                             })()}
                           </div>
@@ -2908,7 +2901,9 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                     {!hasRedirected ? (
                       <>
                         <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20 text-amber-950 font-medium text-xs font-sans text-left leading-relaxed">
-                          Após efetuar o pagamento do sinal de 50%, clique abaixo para enviar o resumo do seu pedido no WhatsApp
+                          {formData.paymentPlan === 'full'
+                            ? 'Após efetuar o pagamento integral, clique abaixo para enviar o resumo do seu pedido no WhatsApp'
+                            : 'Após efetuar o pagamento do sinal de 50%, clique abaixo para enviar o resumo do seu pedido no WhatsApp'}
                         </div>
 
                         <div className="grid grid-cols-1 gap-3 pt-2">
@@ -3590,9 +3585,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                         const deliveryFee = formData.deliveryOption === 'delivery'
                           ? (formData.neighborhood === 'Outro' ? 0 : Number(selectedNeighborhoodObj?.fee || 0))
                           : 0;
-                        const finalTotal = cartTotal + deliveryFee;
-                        const depositAmount = Math.round(finalTotal * 50) / 100;
-                        const remainingAmount = Math.round((finalTotal - depositAmount) * 100) / 100;
+                        const finalTotal = Math.round((cartTotal + deliveryFee) * 100) / 100;
+                        const halfAmount = Math.round(finalTotal * 50) / 100;
+                        const isFullPlan = formData.paymentPlan === 'full';
+                        const chargeAmount = isFullPlan ? finalTotal : halfAmount;
+                        const remainingAmount = isFullPlan ? 0 : Math.round((finalTotal - halfAmount) * 100) / 100;
 
                         const paymentOptions: {
                           id: 'PIX' | 'CREDIT_CARD' | 'DEBIT_CARD' | 'BOLETO';
@@ -3608,91 +3605,149 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
                         return (
                           <div className="space-y-4">
-                            <div className="space-y-2 p-3.5 rounded-2xl bg-white border border-gray-200 shadow-2xs">
-                              <div className="flex items-center justify-between">
-                                <label className="text-xs font-bold uppercase text-black">
-                                  Forma de Pagamento (Sinal 50%) *
+                            <div className="space-y-3 p-3.5 rounded-2xl bg-white border border-gray-200 shadow-2xs">
+                              {/* Opção de valor: 50% Sinal ou 100% Integral */}
+                              <div className="space-y-1.5">
+                                <label className="text-xs font-bold uppercase text-black block">
+                                  Valor a Pagar Agora *
                                 </label>
-                              </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setFormData({ ...formData, paymentPlan: 'half' })}
+                                    className={cn(
+                                      'p-2.5 rounded-xl border text-left transition-all cursor-pointer',
+                                      !isFullPlan
+                                        ? 'text-white shadow-sm'
+                                        : 'bg-gray-50 text-black border-gray-300 hover:bg-gray-100'
+                                    )}
+                                    style={
+                                      !isFullPlan
+                                        ? {
+                                            backgroundColor: settings.primaryColor || '#424733',
+                                            borderColor: settings.primaryColor || '#424733',
+                                            color: getContrastText(settings.primaryColor || '#424733'),
+                                          }
+                                        : undefined
+                                    }
+                                  >
+                                    <div className="text-xs font-extrabold leading-tight">Sinal 50%</div>
+                                    <div className={cn('text-[10px] mt-0.5', !isFullPlan ? 'opacity-90' : 'text-gray-600')}>
+                                      {currencySymbol}{halfAmount.toFixed(2).replace('.', ',')} agora + 50% na entrega
+                                    </div>
+                                  </button>
 
-                              <div className="grid grid-cols-2 gap-2">
-                                {paymentOptions.map(opt => {
-                                  const isSelected = formData.paymentMethod === opt.id;
-                                  return (
-                                    <button
-                                      key={opt.id}
-                                      type="button"
-                                      onClick={() =>
-                                        setFormData({
-                                          ...formData,
-                                          paymentMethod: opt.id,
-                                          installments: opt.id === 'CREDIT_CARD' ? Math.min(2, formData.installments) : 1,
-                                        })
-                                      }
-                                      className={cn(
-                                        'p-3 rounded-xl border text-left transition-all cursor-pointer flex items-center gap-2.5',
-                                        isSelected
-                                          ? 'text-white shadow-sm'
-                                          : 'bg-white text-black border-gray-300 hover:bg-gray-50'
-                                      )}
-                                      style={
-                                        isSelected
-                                          ? {
-                                              backgroundColor: settings.primaryColor || '#424733',
-                                              borderColor: settings.primaryColor || '#424733',
-                                              color: getContrastText(settings.primaryColor || '#424733'),
-                                            }
-                                          : undefined
-                                      }
-                                    >
-                                      <span className="shrink-0">{opt.icon}</span>
-                                      <div className="min-w-0">
-                                        <div className="text-xs font-extrabold leading-tight">{opt.label}</div>
-                                        <div
-                                          className={cn(
-                                            'text-[10px] leading-tight mt-0.5',
-                                            isSelected ? 'opacity-85' : 'text-gray-500'
-                                          )}
-                                        >
-                                          {opt.sublabel}
-                                        </div>
-                                      </div>
-                                    </button>
-                                  );
-                                })}
-                              </div>
-
-                              {formData.paymentMethod === 'CREDIT_CARD' && (
-                                <div className="pt-2 space-y-1.5">
-                                  <label className="text-[11px] font-bold uppercase text-gray-700 block">
-                                    Parcelamento no Cartão de Crédito (sobre o sinal de 50%)
-                                  </label>
-                                  <div className="grid grid-cols-2 gap-2">
-                                    {[1, 2].map(n => {
-                                      const parcela = depositAmount / n;
-                                      const active = formData.installments === n;
-                                      return (
-                                        <button
-                                          key={n}
-                                          type="button"
-                                          onClick={() => setFormData({ ...formData, installments: n })}
-                                          className={cn(
-                                            'py-2 px-2 rounded-xl border text-center transition-all cursor-pointer',
-                                            active
-                                              ? 'bg-black text-white border-black shadow-xs'
-                                              : 'bg-gray-50 text-black border-gray-300 hover:bg-gray-100'
-                                          )}
-                                        >
-                                          <div className="text-xs font-extrabold">{n}x</div>
-                                          <div className={cn('text-[10px]', active ? 'text-white/85' : 'text-gray-600')}>
-                                            {currencySymbol}{parcela.toFixed(2).replace('.', ',')}
-                                          </div>
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => setFormData({ ...formData, paymentPlan: 'full' })}
+                                    className={cn(
+                                      'p-2.5 rounded-xl border text-left transition-all cursor-pointer',
+                                      isFullPlan
+                                        ? 'text-white shadow-sm'
+                                        : 'bg-gray-50 text-black border-gray-300 hover:bg-gray-100'
+                                    )}
+                                    style={
+                                      isFullPlan
+                                        ? {
+                                            backgroundColor: settings.primaryColor || '#424733',
+                                            borderColor: settings.primaryColor || '#424733',
+                                            color: getContrastText(settings.primaryColor || '#424733'),
+                                          }
+                                        : undefined
+                                    }
+                                  >
+                                    <div className="text-xs font-extrabold leading-tight">Integral (100%)</div>
+                                    <div className={cn('text-[10px] mt-0.5', isFullPlan ? 'opacity-90' : 'text-gray-600')}>
+                                      {currencySymbol}{finalTotal.toFixed(2).replace('.', ',')} • Quitado agora
+                                    </div>
+                                  </button>
                                 </div>
-                              )}
+                              </div>
+
+                              <div className="pt-2 border-t border-gray-100 space-y-2">
+                                <label className="text-xs font-bold uppercase text-black block">
+                                  Forma de Pagamento *
+                                </label>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                  {paymentOptions.map(opt => {
+                                    const isSelected = formData.paymentMethod === opt.id;
+                                    return (
+                                      <button
+                                        key={opt.id}
+                                        type="button"
+                                        onClick={() =>
+                                          setFormData({
+                                            ...formData,
+                                            paymentMethod: opt.id,
+                                            installments: opt.id === 'CREDIT_CARD' ? Math.min(2, formData.installments) : 1,
+                                          })
+                                        }
+                                        className={cn(
+                                          'p-3 rounded-xl border text-left transition-all cursor-pointer flex items-center gap-2.5',
+                                          isSelected
+                                            ? 'text-white shadow-sm'
+                                            : 'bg-white text-black border-gray-300 hover:bg-gray-50'
+                                        )}
+                                        style={
+                                          isSelected
+                                            ? {
+                                                backgroundColor: settings.primaryColor || '#424733',
+                                                borderColor: settings.primaryColor || '#424733',
+                                                color: getContrastText(settings.primaryColor || '#424733'),
+                                              }
+                                            : undefined
+                                        }
+                                      >
+                                        <span className="shrink-0">{opt.icon}</span>
+                                        <div className="min-w-0">
+                                          <div className="text-xs font-extrabold leading-tight">{opt.label}</div>
+                                          <div
+                                            className={cn(
+                                              'text-[10px] leading-tight mt-0.5',
+                                              isSelected ? 'opacity-85' : 'text-gray-500'
+                                            )}
+                                          >
+                                            {opt.sublabel}
+                                          </div>
+                                        </div>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+
+                                {formData.paymentMethod === 'CREDIT_CARD' && (
+                                  <div className="pt-2 space-y-1.5">
+                                    <label className="text-[11px] font-bold uppercase text-gray-700 block">
+                                      Parcelamento no Cartão de Crédito ({isFullPlan ? 'sobre o valor integral' : 'sobre o sinal de 50%'})
+                                    </label>
+                                    <div className="grid grid-cols-2 gap-2">
+                                      {[1, 2].map(n => {
+                                        const parcela = chargeAmount / n;
+                                        const active = formData.installments === n;
+                                        return (
+                                          <button
+                                            key={n}
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, installments: n })}
+                                            className={cn(
+                                              'py-2 px-2 rounded-xl border text-center transition-all cursor-pointer',
+                                              active
+                                                ? 'bg-black text-white border-black shadow-xs'
+                                                : 'bg-gray-50 text-black border-gray-300 hover:bg-gray-100'
+                                            )}
+                                          >
+                                            <div className="text-xs font-extrabold">{n}x</div>
+                                            <div className={cn('text-[10px]', active ? 'text-white/85' : 'text-gray-600')}>
+                                              {currencySymbol}{parcela.toFixed(2).replace('.', ',')}
+                                            </div>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
                             </div>
 
                             <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200 shadow-2xs space-y-2 text-xs">
@@ -3721,15 +3776,17 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                               <div className="pt-2 border-t border-dashed border-gray-300 space-y-1">
                                 <div className="flex justify-between items-center text-sm font-extrabold">
                                   <span style={{ color: settings.primaryColor || '#424733' }}>
-                                    Sinal para efetivar agora (50%):
+                                    {isFullPlan ? 'Pagamento integral agora (100%):' : 'Sinal para efetivar agora (50%):'}
                                   </span>
                                   <span className="text-lg font-black" style={{ color: settings.primaryColor || '#424733' }}>
-                                    {currencySymbol}{depositAmount.toFixed(2)}
+                                    {currencySymbol}{chargeAmount.toFixed(2)}
                                   </span>
                                 </div>
                                 <div className="flex justify-between items-center text-[11px] text-gray-600">
-                                  <span>Restante na entrega/retirada (50%):</span>
-                                  <span className="font-bold text-gray-800">{currencySymbol}{remainingAmount.toFixed(2)}</span>
+                                  <span>{isFullPlan ? 'Restante na entrega/retirada:' : 'Restante na entrega/retirada (50%):'}</span>
+                                  <span className="font-bold text-gray-800">
+                                    {isFullPlan ? `${currencySymbol}0.00 (Quitado)` : `${currencySymbol}${remainingAmount.toFixed(2)}`}
+                                  </span>
                                 </div>
                               </div>
                             </div>

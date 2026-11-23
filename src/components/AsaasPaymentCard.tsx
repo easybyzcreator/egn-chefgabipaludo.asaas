@@ -19,6 +19,7 @@ export interface AsaasPaymentResult {
   paymentId: string;
   status: string;
   paid: boolean;
+  paymentPlan?: 'half' | 'full';
   paidAmount?: number;
   paidPercent?: number;
   paidInstallmentsCount?: number;
@@ -202,11 +203,15 @@ export default function AsaasPaymentCard({
             totalInstallments: data.totalInstallments,
             installments: data.installments,
           });
-          toast.success('Pagamento do sinal de 50% confirmado com sucesso!');
+          toast.success(
+            payment?.paymentPlan === 'full'
+              ? 'Pagamento integral confirmado com sucesso!'
+              : 'Pagamento do sinal de 50% confirmado com sucesso!',
+          );
         } else if (manual) {
           if (typeof data?.paidAmount === 'number' && data.paidAmount > 0) {
             toast.info(
-              `Pagamento parcial identificado (${currencySymbol}${data.paidAmount.toFixed(2).replace('.', ',')} • ${data.paidInstallmentsCount || 1}/${data.totalInstallments || totalInstallments} parcelas). Aguardando confirmação do restante do sinal.`,
+              `Pagamento parcial identificado (${currencySymbol}${data.paidAmount.toFixed(2).replace('.', ',')} • ${data.paidInstallmentsCount || 1}/${data.totalInstallments || totalInstallments} parcelas). Aguardando confirmação do restante.`,
             );
           } else {
             toast.info('Pagamento ainda aguardando confirmação.');
@@ -275,6 +280,7 @@ export default function AsaasPaymentCard({
   const safeBankSlipUrl = getSafeExternalUrl(payment.bankSlipUrl);
   const formattedDueDate = formatBrDate(payment.dueDate);
   const hasPartialPayment = !isPaid && paidAmount > 0;
+  const isFullPlan = payment.paymentPlan === 'full';
 
   return (
     <div className="p-4 rounded-2xl bg-white border-2 border-gray-200 text-left max-w-sm mx-auto space-y-4 shadow-sm font-sans">
@@ -290,7 +296,7 @@ export default function AsaasPaymentCard({
           )}
           <div>
             <p className="text-[10px] font-extrabold uppercase tracking-wider text-gray-500">
-              Pagamento do Sinal (50%)
+              {isFullPlan ? 'Pagamento Integral (100%)' : 'Pagamento do Sinal (50%)'}
             </p>
             <p className="text-xs font-bold text-black">
               {getBillingLabel(payment.billingType, payment.installmentCount)}
@@ -299,10 +305,12 @@ export default function AsaasPaymentCard({
         </div>
       </div>
 
-      {/* 50% Deposit Values */}
+      {/* Payment Values */}
       <div className="p-3 rounded-xl bg-gray-50 border border-gray-200 space-y-1 text-xs">
         <div className="flex justify-between items-center">
-          <span className="text-gray-700 font-semibold">Sinal agora (50%):</span>
+          <span className="text-gray-700 font-semibold">
+            {isFullPlan ? 'Total agora (100%):' : 'Sinal agora (50%):'}
+          </span>
           <span className="text-base font-black" style={{ color: primaryColor }}>
             {currencySymbol}{payment.depositAmount.toFixed(2).replace('.', ',')}
           </span>
@@ -317,9 +325,11 @@ export default function AsaasPaymentCard({
           </div>
         )}
         <div className="flex justify-between items-center text-[11px] text-gray-600">
-          <span>Restante na entrega/retirada (50%):</span>
+          <span>{isFullPlan ? 'Restante na entrega/retirada:' : 'Restante na entrega/retirada (50%):'}</span>
           <span className="font-bold text-gray-800">
-            {currencySymbol}{payment.remainingAmount.toFixed(2).replace('.', ',')}
+            {isFullPlan
+              ? `${currencySymbol}0,00 (Quitado)`
+              : `${currencySymbol}${payment.remainingAmount.toFixed(2).replace('.', ',')}`}
           </span>
         </div>
         {formattedDueDate && (
@@ -340,7 +350,7 @@ export default function AsaasPaymentCard({
             Pagamento parcial identificado: {currencySymbol}{paidAmount.toFixed(2).replace('.', ',')} ({paidPercent.toFixed(1).replace('.0', '')}% do pedido)
           </p>
           <p className="text-amber-900 leading-relaxed">
-            {paidInstallmentsCount} de {totalInstallments} parcela(s) confirmada(s). Aguardando confirmação das demais parcelas para concluir o sinal de 50%.
+            {paidInstallmentsCount} de {totalInstallments} parcela(s) confirmada(s). Aguardando confirmação das demais parcelas.
           </p>
         </div>
       )}
@@ -350,7 +360,7 @@ export default function AsaasPaymentCard({
         <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-center space-y-1.5">
           <CheckCircle2 size={32} className="text-emerald-600 mx-auto" />
           <p className="text-sm font-black text-emerald-900">
-            Sinal de 50% Confirmado!
+            {isFullPlan ? 'Pagamento Integral Confirmado!' : 'Sinal de 50% Confirmado!'}
           </p>
           <p className="text-[11px] text-emerald-800 leading-relaxed">
             Seu pagamento foi confirmado automaticamente e seu pedido já está validado para produção.
@@ -478,8 +488,8 @@ export default function AsaasPaymentCard({
                   <CreditCard size={15} />
                   <span>
                     {payment.billingType === 'DEBIT_CARD'
-                      ? 'Pagar Sinal no Débito'
-                      : 'Pagar Sinal no Crédito'}
+                      ? (isFullPlan ? 'Pagar Integral no Débito' : 'Pagar Sinal no Débito')
+                      : (isFullPlan ? 'Pagar Integral no Crédito' : 'Pagar Sinal no Crédito')}
                   </span>
                   <ExternalLink size={13} />
                 </a>
