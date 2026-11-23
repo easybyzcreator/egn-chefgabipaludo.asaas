@@ -503,7 +503,7 @@ export function handleAsaasConfig(req, res) {
     configured: Boolean(apiKey),
     environment,
     depositPercentage: 50,
-    maxInstallments: 3,
+    maxInstallments: 2,
     supportedMethods: ['PIX', 'CREDIT_CARD', 'DEBIT_CARD', 'BOLETO'],
   });
 }
@@ -550,7 +550,7 @@ export async function handleCreatePayment(req, res) {
 
     const parsedInstallments =
       billingType === 'CREDIT_CARD'
-        ? Math.min(3, Math.max(1, Math.floor(Number(installmentCount) || 1)))
+        ? Math.min(2, Math.max(1, Math.floor(Number(installmentCount) || 1)))
         : 1;
 
     const savedOrder = await getFirestoreOrder(orderId);

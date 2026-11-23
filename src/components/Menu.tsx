@@ -1373,7 +1373,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
       const depositAmount = Math.round(finalTotalWithDelivery * 50) / 100;
       const selectedInstallments = formData.paymentMethod === 'CREDIT_CARD'
-        ? Math.min(3, Math.max(1, Number(formData.installments) || 1))
+        ? Math.min(2, Math.max(1, Number(formData.installments) || 1))
         : 1;
 
       const orderData: Omit<Order, 'id'> = {
@@ -1659,7 +1659,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     setAsaasError(null);
     try {
       const selectedInstallments = formData.paymentMethod === 'CREDIT_CARD'
-        ? Math.min(3, Math.max(1, Number(formData.installments) || 1))
+        ? Math.min(2, Math.max(1, Number(formData.installments) || 1))
         : 1;
       const neighborhoodName = formData.deliveryOption === 'delivery'
         ? (formData.neighborhood === 'Outro' ? `Outro (${formData.customNeighborhood.trim()})` : formData.neighborhood)
@@ -3600,10 +3600,10 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           sublabel: string;
                           icon: React.ReactNode;
                         }[] = [
-                          { id: 'PIX', label: 'Pix', sublabel: 'QR Code imediato', icon: <QrCode size={16} /> },
-                          { id: 'CREDIT_CARD', label: 'Crédito', sublabel: 'Em até 3x', icon: <CreditCard size={16} /> },
-                          { id: 'DEBIT_CARD', label: 'Débito', sublabel: 'Cartão de débito', icon: <CreditCard size={16} /> },
-                          { id: 'BOLETO', label: 'Boleto', sublabel: 'Vencimento hoje', icon: <Barcode size={16} /> },
+                          { id: 'PIX', label: 'Pix', sublabel: 'À vista • QR Code', icon: <QrCode size={16} /> },
+                          { id: 'CREDIT_CARD', label: 'Crédito', sublabel: 'Em até 2x', icon: <CreditCard size={16} /> },
+                          { id: 'DEBIT_CARD', label: 'Débito', sublabel: 'Parcela única', icon: <CreditCard size={16} /> },
+                          { id: 'BOLETO', label: 'Boleto', sublabel: 'Parcela única • Hoje', icon: <Barcode size={16} /> },
                         ];
 
                         return (
@@ -3626,7 +3626,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                                         setFormData({
                                           ...formData,
                                           paymentMethod: opt.id,
-                                          installments: opt.id === 'CREDIT_CARD' ? formData.installments : 1,
+                                          installments: opt.id === 'CREDIT_CARD' ? Math.min(2, formData.installments) : 1,
                                         })
                                       }
                                       className={cn(
@@ -3667,8 +3667,8 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                                   <label className="text-[11px] font-bold uppercase text-gray-700 block">
                                     Parcelamento no Cartão de Crédito (sobre o sinal de 50%)
                                   </label>
-                                  <div className="grid grid-cols-3 gap-2">
-                                    {[1, 2, 3].map(n => {
+                                  <div className="grid grid-cols-2 gap-2">
+                                    {[1, 2].map(n => {
                                       const parcela = depositAmount / n;
                                       const active = formData.installments === n;
                                       return (
