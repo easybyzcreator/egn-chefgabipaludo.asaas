@@ -9470,30 +9470,34 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                                   {order.items?.map(it => `${it.quantity}x ${it.title}`).join(', ')}
                                 </div>
 
-                                <div className="flex items-center justify-between pt-1.5 border-t border-gray-100 text-[11px]">
-                                  <div>
+                                <div className="flex items-center justify-between gap-1.5 flex-wrap pt-1.5 border-t border-gray-100 text-[10px]">
+                                  <div className="min-w-0">
                                     {order.paymentStatus === 'full' ? (
-                                      <span className="font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-md">
-                                        🟢 Pago
+                                      <span className="inline-flex items-center gap-1 whitespace-nowrap leading-none font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-1 rounded-md">
+                                        <span>🟢</span>
+                                        <span>Pago</span>
                                       </span>
                                     ) : order.paymentStatus === 'half' ? (
-                                      <span className="font-bold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-md flex items-center gap-1">
-                                        🟡 {typeof order.asaasPaidPercent === 'number' && order.asaasPaidPercent > 0 ? formatPercentLabel(order.asaasPaidPercent) : '50%'}
+                                      <span className="inline-flex items-center gap-1 whitespace-nowrap leading-none font-bold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-1 rounded-md">
+                                        <span>🟡</span>
+                                        <span>{typeof order.asaasPaidPercent === 'number' && order.asaasPaidPercent > 0 ? formatPercentLabel(order.asaasPaidPercent) : '50%'}</span>
                                       </span>
                                     ) : Number(order.asaasPaidAmount || 0) > 0 ? (
                                       <span
-                                        className="font-bold text-orange-800 bg-orange-50 border border-orange-300 px-1.5 py-0.5 rounded-md inline-flex items-center gap-1"
+                                        className="inline-flex items-center gap-1 whitespace-nowrap leading-none font-bold text-orange-800 bg-orange-50 border border-orange-300 px-1.5 py-1 rounded-md"
                                         title={`Pago ${currencySymbol} ${Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')} (${formatPercentLabel(order.asaasPaidPercent)})`}
                                       >
-                                        🟠 {formatPercentLabel(order.asaasPaidPercent)} ({currencySymbol} {Number(order.asaasPaidAmount).toFixed(2).replace('.', ',')})
+                                        <span>🟠</span>
+                                        <span>{formatPercentLabel(order.asaasPaidPercent)}</span>
                                       </span>
                                     ) : (
-                                      <span className="font-bold text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded-md">
-                                        🔴 Pendente
+                                      <span className="inline-flex items-center gap-1 whitespace-nowrap leading-none font-bold text-red-700 bg-red-50 border border-red-200 px-1.5 py-1 rounded-md">
+                                        <span>🔴</span>
+                                        <span>Pendente</span>
                                       </span>
                                     )}
                                   </div>
-                                  <span className="font-extrabold text-sm text-gray-900">
+                                  <span className="font-extrabold text-xs text-gray-900 whitespace-nowrap shrink-0">
                                     {currencySymbol} {order.total.toFixed(2).replace('.', ',')}
                                   </span>
                                 </div>
